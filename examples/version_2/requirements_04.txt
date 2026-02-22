@@ -1,0 +1,35 @@
+TITLE: Aggregate experiments by group and normalise (CSV -> CSV)
+GOAL:
+  Read CSV input_path with columns: group (string), measurement (float).
+  For each group, compute count, mean, std (sample std, ddof=1), and z-score for each row.
+  Write CSV output_path with original columns plus: group_mean, group_std, z.
+  If group_std is 0 or NaN (e.g., group has <2 rows), set z = 0 for that group.
+  Return summary dict with keys: n_rows, n_groups, groups_with_zero_std.
+
+ENTRY POINT (Python):
+  def run(input_path: str, output_path: str, *, seed: int | None = None) -> dict | None
+
+INPUTS:
+  - input_path:
+      format: CSV
+      schema: group: str, measurement: float
+      constraints: measurement finite
+
+OUTPUTS:
+  - output_path:
+      format: CSV
+      schema: group, measurement, group_mean, group_std, z
+
+NUMERICAL REQUIREMENTS:
+  - Deterministic: yes.
+  - No NaNs in z.
+
+ALLOWED LIBRARIES:
+  numpy, pandas
+
+# Verification contract (StructGen v2)
+@input_file: input_04_groups.csv
+@output_file: output_04.csv
+@output_schema: group,measurement,group_mean,group_std,z
+@check: columns(group,measurement,group_mean,group_std,z)
+@check: finite(measurement,group_mean,group_std,z)
