@@ -182,7 +182,8 @@ def plantuml_render_png(puml_path: str, png_path: str, plantuml_jar_path: str, l
     out_dir = os.path.dirname(png_path)
     os.makedirs(out_dir, exist_ok=True)
     try:
-        cmd = ["java", "-jar", plantuml_jar_path, "-failonerror", "-noerror", "-tpng", puml_path, "-o", out_dir]
+        # cmd = ["java", "-jar", plantuml_jar_path, "-failonerror", "-noerror", "-tpng", puml_path, "-o", out_dir]
+        cmd = ["java", "-jar", plantuml_jar_path, "-failonerror", "-noerror", "-tpng", puml_path]
         logger.info("PlantUML render: %s", " ".join(cmd))
         cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if cp.returncode != 0:
@@ -191,7 +192,8 @@ def plantuml_render_png(puml_path: str, png_path: str, plantuml_jar_path: str, l
                 err = "PlantUML render failed (non-zero exit code)."
             return False, err
         base = os.path.splitext(os.path.basename(puml_path))[0]
-        produced = os.path.join(out_dir, base + ".png")
+        # produced = os.path.join(out_dir, base + ".png")
+        produced = os.path.join(os.path.dirname(puml_path), base + ".png")
         if os.path.exists(produced):
             if os.path.abspath(produced) != os.path.abspath(png_path):
                 shutil.move(produced, png_path)
