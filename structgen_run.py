@@ -1,30 +1,19 @@
 #!/usr/bin/env python3
-"""StructGen-style automated code generation (v1) with UML syntax check + auto-repair.
+"""StructGen runner v1 (minimal verifier) with:
+- PlantUML syntax-check + UML auto-repair after EVERY Designer call
+- Optional logging of all prompts (system+user) used in the run
 
-Key features
-- Reads tasks from requirements.txt (split by a line containing only '---')
-- Uses Ollama via OpenAI-compatible API (base_url like http://localhost:11434/v1)
-- Produces per-task outputs:
-  * UML diagram as PlantUML text (.puml)
-  * UML diagram as PNG (.png) if Java + plantuml.jar are available
-  * Generated Python file (.py) with entry point: run(input_path, output_path, ...) -> Optional[summary]
-  * Logs (global out/run.log and per-task task.log)
+CLI:
+  python structgen_run.py [--requirements requirements.txt] [--prompts prompts] [--out out]
+                         [--config structgen_config.json] [--smoke-test]
+                         [--log-prompts] [--log-prompts-include-runlog]
 
-UML robustness
-- Before rendering, the runner performs a PlantUML syntax check.
-- If the UML has syntax errors, the runner asks the Designer to repair UML (syntax-only) and retries.
-- This syntax-check + repair loop runs after *every* call to the Designer:
-  * initial UML generation
-  * design revision steps
+Prompt logging (disabled by default):
+- When enabled, all prompts are written to out/<task>/prompts_used/*.txt
+- Also logged into out/<task>/task.log.
+- If --log-prompts-include-runlog is set, prompts are additionally echoed into out/run.log.
 
-Prompt templates are read from ./prompts:
-  - designer_plantuml.md
-  - coder_python.md
-  - repair_code.md
-  - revise_design.md
-  - repair_uml.md (optional, used for UML repair)
-
-Config is read from structgen_config.json.
+Note: logging prompts may leak sensitive content. Use only in trusted environments.
 """
 
 from __future__ import annotations
@@ -39,6 +28,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
@@ -116,6 +106,25 @@ def load_prompt_optional(prompts_dir: str, filename: str) -> Optional[str]:
     return read_text(path) if os.path.exists(path) else None
 
 
+def setup_logger(log_path: str, also_console: bool = True) -> logging.Logger:
+    logger = logging.getLogger(log_path)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    if also_console:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    return logger
+
+
 # ----------------------------
 # Config
 # ----------------------------
@@ -135,12 +144,15 @@ class Config:
     max_code_repairs: int = 2
     max_design_revisions: int = 4
 
-    # UML syntax-check + auto-repair
     max_uml_repairs: int = 2
 
     plantuml_jar_path: str = "./plantuml.jar"
 
     smoke_test: bool = False
+
+    # NEW: prompt logging
+    log_prompts: bool = False
+    log_prompts_include_runlog: bool = False
 
     @staticmethod
     def load(path: str) -> "Config":
@@ -173,52 +185,94 @@ class LLM:
 
 
 # ----------------------------
-# PlantUML: syntax check + render
+# Prompt logging
 # ----------------------------
 
-def plantuml_check(puml_path: str, plantuml_jar_path: str) -> Tuple[bool, str]:
-    """Run PlantUML syntax check and return (ok, error_text)."""
-    if not os.path.exists(plantuml_jar_path):
-        return False, f"PlantUML jar not found at {plantuml_jar_path}"
+def log_prompt_bundle(
+    enabled: bool,
+    include_runlog: bool,
+    task_dir: str,
+    task_logger: logging.Logger,
+    run_logger: logging.Logger,
+    tag: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> None:
+    if not enabled:
+        return
+
+    prompts_dir = os.path.join(task_dir, "prompts_used")
+    os.makedirs(prompts_dir, exist_ok=True)
+
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    safe_tag = re.sub(r"[^a-zA-Z0-9_\-]+", "_", tag)[:80]
+    path = os.path.join(prompts_dir, f"{ts}_{safe_tag}.txt")
+
+    blob = (
+        f"=== PROMPT TAG: {tag} ===\n"
+        f"=== SYSTEM ===\n{system_prompt}\n\n"
+        f"=== USER ===\n{user_prompt}\n"
+    )
+    write_text(path, blob)
+
+    # Always include in task.log
+    task_logger.info("PROMPT_SAVED: %s", path)
+    task_logger.info("PROMPT_BEGIN %s\n%s\nPROMPT_END %s", tag, blob, tag)
+
+    # Optionally include in global run.log
+    if include_runlog:
+        run_logger.info("PROMPT_SAVED: %s", path)
+        run_logger.info("PROMPT_BEGIN %s\n%s\nPROMPT_END %s", tag, blob, tag)
+
+
+# ----------------------------
+# PlantUML (syntax check + render)
+# ----------------------------
+
+def plantuml_check(puml_path: str, jar_path: str, logger: logging.Logger) -> Tuple[bool, str]:
+    if not os.path.exists(jar_path):
+        return False, f"PlantUML jar not found at {jar_path}"
     try:
-        cmd = ["java", "-jar", plantuml_jar_path, "-checkonly", "-failonerror", puml_path]
+        cmd = ["java", "-jar", jar_path, "-checkonly", "-failonerror", puml_path]
+        logger.info("PlantUML check: %s", " ".join(cmd))
         cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if cp.returncode != 0:
-            err = (cp.stderr or cp.stdout or "").strip()
-            if not err:
-                err = "PlantUML syntax check failed (non-zero exit code)."
-            return False, err
-        return True, ""
+        if cp.returncode == 0:
+            return True, ""
+        err = (cp.stderr or cp.stdout or "").strip()
+        if not err:
+            err = f"PlantUML syntax check failed (exit code {cp.returncode})."
+        return False, err
     except FileNotFoundError:
-        return False, "Java not found on PATH (install Java to enable UML checking/rendering)."
+        return False, "Java not found on PATH (install Java to enable PlantUML)."
 
 
-def plantuml_render_png(puml_path: str, png_path: str, plantuml_jar_path: str, logger: logging.Logger) -> Tuple[bool, str]:
-    """Render PNG. Assumes syntax check already passed. Returns (ok, err)."""
-    if not os.path.exists(plantuml_jar_path):
-        return False, f"PlantUML jar not found at {plantuml_jar_path}"
-    out_dir = os.path.dirname(png_path)
-    os.makedirs(out_dir, exist_ok=True)
+def plantuml_render_png(puml_path: str, png_path: str, jar_path: str, logger: logging.Logger) -> Tuple[bool, str]:
+    if not os.path.exists(jar_path):
+        return False, f"PlantUML jar not found at {jar_path}"
+
+    out_dir_abs = os.path.abspath(os.path.dirname(png_path))
+    os.makedirs(out_dir_abs, exist_ok=True)
+
     try:
-        # cmd = ["java", "-jar", plantuml_jar_path, "-failonerror", "-noerror", "-tpng", puml_path, "-o", out_dir]
-        cmd = ["java", "-jar", plantuml_jar_path, "-failonerror", "-noerror", "-tpng", puml_path]
+        cmd = ["java", "-jar", jar_path, "-failonerror", "-noerror", "-tpng", puml_path, "-o", out_dir_abs]
         logger.info("PlantUML render: %s", " ".join(cmd))
         cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if cp.returncode != 0:
             err = (cp.stderr or cp.stdout or "").strip()
             if not err:
-                err = "PlantUML render failed (non-zero exit code)."
+                err = f"PlantUML render failed (exit code {cp.returncode})."
             return False, err
+
         base = os.path.splitext(os.path.basename(puml_path))[0]
-        # produced = os.path.join(out_dir, base + ".png")
-        produced = os.path.join(os.path.dirname(puml_path), base + ".png")
+        produced = os.path.join(out_dir_abs, base + ".png")
         if os.path.exists(produced):
             if os.path.abspath(produced) != os.path.abspath(png_path):
                 shutil.move(produced, png_path)
             return True, ""
         return False, "PlantUML did not produce an output PNG."
+
     except FileNotFoundError:
-        return False, "Java not found on PATH (install Java to enable PNG rendering)."
+        return False, "Java not found on PATH (install Java to enable PlantUML)."
 
 
 def build_repair_uml_prompt(requirement_packet: str, uml_text: str, plantuml_error: str, template: Optional[str]) -> str:
@@ -226,59 +280,79 @@ def build_repair_uml_prompt(requirement_packet: str, uml_text: str, plantuml_err
         return template.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=uml_text, PLANTUML_ERROR=plantuml_error)
     return (
         "Role: Designer (UML Repair Mode)\n\n"
-        "PlantUML reported syntax errors for the following ACTIVITY DIAGRAM.\n"
-        "Fix ONLY the PlantUML syntax so it renders. Do NOT switch diagram types.\n"
-        "Use activity syntax: start/stop, :actions;, if/endif, while/endwhile, repeat/repeat while.\n"
-        "Do NOT use arrows (->), do/end while, or missing semicolons on actions.\n\n"
-        "PlantUML error:\n"
-        f"{plantuml_error}\n\n"
-        "Requirement packet:\n"
-        f"{requirement_packet}\n\n"
-        "Previous UML:\n"
-        f"```plantuml\n{uml_text}\n```\n\n"
-        "STRICT OUTPUT: Output ONLY one fenced ```plantuml``` block containing a valid activity diagram.\n"
+        "Fix ONLY PlantUML activity-diagram syntax so -checkonly passes and PNG renders.\n"
+        "Rules: one @startuml..@enduml, start/stop, :actions;, if/endif, while/endwhile, no '->', no 'do', no 'end while'.\n\n"
+        f"PlantUML error:\n{plantuml_error}\n\n"
+        f"Requirement packet:\n{requirement_packet}\n\n"
+        f"Previous UML:\n```plantuml\n{uml_text}\n```\n\n"
+        "OUTPUT: one fenced ```plantuml``` block only.\n"
     )
 
 
-def ensure_valid_uml(
+def validate_and_render_uml_with_repair(
     llm: LLM,
     cfg: Config,
     requirement_packet: str,
-    uml_text: str,
-    puml_path: str,
     prompts_dir: str,
-    logger: logging.Logger,
+    task_dir: str,
+    task_slug: str,
+    uml_text: str,
+    task_logger: logging.Logger,
+    run_logger: logging.Logger,
 ) -> Tuple[str, bool, str]:
-    """Check UML syntax; if invalid, trigger repair loop. Returns (uml_text, ok, last_error)."""
-    repair_tpl = load_prompt_optional(prompts_dir, "repair_uml.md")
-    current = uml_text
+    """Syntax-check UML first, trigger repair, then render PNG."""
+
+    repair_uml_tpl = load_prompt_optional(prompts_dir, "repair_uml.md")
+
+    puml_path = os.path.join(task_dir, f"{task_slug}.puml")
+    png_path = os.path.join(task_dir, f"{task_slug}.png")
+
+    current_uml = uml_text
     last_err = ""
 
     for attempt in range(cfg.max_uml_repairs + 1):
-        write_text(puml_path, current + "\n")
-        ok, err = plantuml_check(puml_path, cfg.plantuml_jar_path)
+        write_text(puml_path, current_uml + "\n")
+
+        ok, err = plantuml_check(puml_path, cfg.plantuml_jar_path, run_logger)
+        if not ok:
+            last_err = err
+            task_logger.info("UML syntax check failed (attempt %d/%d): %s", attempt + 1, cfg.max_uml_repairs + 1, err)
+            if attempt >= cfg.max_uml_repairs:
+                return current_uml, False, last_err
+
+            # Ask Designer to repair UML
+            system_p = "You repair PlantUML activity diagrams to be syntactically valid."
+            user_p = build_repair_uml_prompt(requirement_packet, current_uml, err, repair_uml_tpl)
+            log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_repair_uml", system_p, user_p)
+            repair_out = llm.chat(model=cfg.designer_model, system=system_p, user=user_p)
+            repaired = extract_fenced_block(repair_out, "plantuml")
+            if repaired:
+                current_uml = repaired
+                continue
+            write_text(os.path.join(task_dir, f"uml_repair_raw_{attempt+1}.txt"), repair_out)
+            return current_uml, False, last_err
+
+        ok, err = plantuml_render_png(puml_path, png_path, cfg.plantuml_jar_path, run_logger)
         if ok:
-            return current, True, ""
+            return current_uml, True, ""
 
         last_err = err
-        logger.info("UML syntax check failed (attempt %d/%d): %s", attempt + 1, cfg.max_uml_repairs + 1, err)
+        task_logger.info("UML render failed (attempt %d/%d): %s", attempt + 1, cfg.max_uml_repairs + 1, err)
         if attempt >= cfg.max_uml_repairs:
-            break
+            return current_uml, False, last_err
 
-        prompt = build_repair_uml_prompt(requirement_packet, current, err, repair_tpl)
-        repair_out = llm.chat(
-            model=cfg.designer_model,
-            system="You repair PlantUML activity diagrams to be syntactically valid.",
-            user=prompt,
-        )
+        system_p = "You repair PlantUML activity diagrams to be syntactically valid."
+        user_p = build_repair_uml_prompt(requirement_packet, current_uml, err, repair_uml_tpl)
+        log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_repair_uml_after_render", system_p, user_p)
+        repair_out = llm.chat(model=cfg.designer_model, system=system_p, user=user_p)
         repaired = extract_fenced_block(repair_out, "plantuml")
         if repaired:
-            current = repaired
-        else:
-            write_text(os.path.join(os.path.dirname(puml_path), f"uml_repair_raw_{attempt+1}.txt"), repair_out)
-            break
+            current_uml = repaired
+            continue
+        write_text(os.path.join(task_dir, f"uml_repair_raw_{attempt+1}.txt"), repair_out)
+        return current_uml, False, last_err
 
-    return current, False, last_err
+    return current_uml, False, last_err
 
 
 # ----------------------------
@@ -304,7 +378,6 @@ def verify_generated_code(code: str, smoke_test: bool) -> Tuple[bool, str]:
     if not smoke_test:
         return True, "Basic verification passed (compile + load + run present)."
 
-    # smoke-test
     try:
         import inspect
         sig = inspect.signature(run_fn)
@@ -318,34 +391,16 @@ def verify_generated_code(code: str, smoke_test: bool) -> Tuple[bool, str]:
                 f.write(b"")
             run_fn(ip, op)
         return True, "Smoke-test verification passed."
+
     except Exception as e:
         return False, f"Smoke-test error: {e}"
 
 
 # ----------------------------
-# Orchestration
+# Task runner
 # ----------------------------
 
-def setup_logger(log_path: str, also_console: bool = True) -> logging.Logger:
-    logger = logging.getLogger(log_path)
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-
-    if also_console:
-        ch = logging.StreamHandler(sys.stdout)
-        ch.setFormatter(fmt)
-        logger.addHandler(ch)
-
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
-
-    return logger
-
-
-def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, out_dir: str, global_logger: logging.Logger) -> None:
+def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, out_dir: str, run_logger: logging.Logger) -> None:
     title = infer_title(requirement_packet)
     task_slug = slugify(title)
     task_dir = os.path.join(out_dir, task_slug)
@@ -354,7 +409,7 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
     task_logger = setup_logger(os.path.join(task_dir, "task.log"), also_console=False)
 
     def log(msg: str, *args: Any) -> None:
-        global_logger.info("[%s] " + msg, task_slug, *args)
+        run_logger.info("[%s] " + msg, task_slug, *args)
         task_logger.info(msg, *args)
 
     log("=== Task started: %s ===", title)
@@ -364,13 +419,12 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
     repair_code_tpl = load_prompt(prompts_dir, "repair_code.md")
     revise_design_tpl = load_prompt(prompts_dir, "revise_design.md")
 
-    # ---- Designer call #1
+    # ---- Designer (initial)
     log("Calling Designer model: %s", cfg.designer_model)
-    designer_out = llm.chat(
-        model=cfg.designer_model,
-        system="You are a careful software designer for scientific Python.",
-        user=designer_tpl.format(REQUIREMENT_PACKET=requirement_packet),
-    )
+    system_p = "You are a careful software designer for scientific Python."
+    user_p = designer_tpl.format(REQUIREMENT_PACKET=requirement_packet)
+    log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_initial", system_p, user_p)
+    designer_out = llm.chat(model=cfg.designer_model, system=system_p, user=user_p)
 
     uml = extract_fenced_block(designer_out, "plantuml")
     if not uml:
@@ -378,32 +432,34 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
         raise RuntimeError("Designer did not produce a PlantUML fenced block. See designer_raw.txt")
 
     architecture = extract_section(designer_out, "Architecture:")
-    contract = extract_section(designer_out, "I/O & Verification Contract:")
+    contract_txt = extract_section(designer_out, "I/O & Verification Contract:")
 
-    puml_path = os.path.join(task_dir, f"{task_slug}.puml")
-    png_path = os.path.join(task_dir, f"{task_slug}.png")
-
-    # ---- UML syntax check + auto-repair (after Designer call)
-    uml, uml_ok, uml_err = ensure_valid_uml(llm, cfg, requirement_packet, uml, puml_path, prompts_dir, global_logger)
-    if uml_ok:
-        ok, err = plantuml_render_png(puml_path, png_path, cfg.plantuml_jar_path, global_logger)
-        if ok:
-            log("Rendered UML PNG: %s", png_path)
-        else:
-            log("UML PNG not rendered: %s", err)
+    # ---- UML syntax-check + repair + render
+    uml, uml_png_ok, uml_err = validate_and_render_uml_with_repair(
+        llm=llm,
+        cfg=cfg,
+        requirement_packet=requirement_packet,
+        prompts_dir=prompts_dir,
+        task_dir=task_dir,
+        task_slug=task_slug,
+        uml_text=uml,
+        task_logger=task_logger,
+        run_logger=run_logger,
+    )
+    if uml_png_ok:
+        log("Rendered UML PNG")
     else:
-        log("UML syntax could not be fixed after retries. Last error: %s", uml_err)
+        log("UML PNG not rendered: %s", uml_err)
 
     write_text(os.path.join(task_dir, "architecture.txt"), architecture + "\n")
-    write_text(os.path.join(task_dir, "contract.txt"), contract + "\n")
+    write_text(os.path.join(task_dir, "contract.txt"), contract_txt + "\n")
 
-    # ---- Coder generation
+    # ---- Coder
     log("Calling Coder model: %s", cfg.coder_model)
-    coder_out = llm.chat(
-        model=cfg.coder_model,
-        system="You are a professional Python developer specialising in numerical/scientific computing.",
-        user=coder_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=uml, ARCHITECTURE_TEXT=architecture, CONTRACT_TEXT=contract),
-    )
+    system_c = "You are a professional Python developer specialising in numerical/scientific computing."
+    user_c = coder_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=uml, ARCHITECTURE_TEXT=architecture, CONTRACT_TEXT=contract_txt)
+    log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "coder_initial", system_c, user_c)
+    coder_out = llm.chat(model=cfg.coder_model, system=system_c, user=user_c)
 
     code = extract_fenced_block(coder_out, "python")
     if not code:
@@ -413,7 +469,6 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
     current_code = code
     current_uml = uml
 
-    # ---- Iteration: repair code, then revise design
     for design_rev in range(cfg.max_design_revisions + 1):
         for repair in range(cfg.max_code_repairs + 1):
             ok, report = verify_generated_code(current_code, cfg.smoke_test)
@@ -432,11 +487,10 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
                 break
 
             log("Repairing code (attempt %d/%d)", repair + 1, cfg.max_code_repairs)
-            repair_out = llm.chat(
-                model=cfg.coder_model,
-                system="You repair scientific Python code based on verification feedback.",
-                user=repair_code_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, PREV_CODE=current_code, FAILURE_REPORT=report),
-            )
+            system_r = "You repair scientific Python code based on verification feedback."
+            user_r = repair_code_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, PREV_CODE=current_code, FAILURE_REPORT=report)
+            log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"coder_repair_{repair+1}", system_r, user_r)
+            repair_out = llm.chat(model=cfg.coder_model, system=system_r, user=user_r)
             repaired = extract_fenced_block(repair_out, "python")
             if repaired:
                 current_code = repaired
@@ -449,39 +503,41 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
             write_text(py_path, current_code + "\n")
             return
 
-        # ---- Designer call (design revision)
+        # ---- Designer (revise design)
         log("Revising design (attempt %d/%d)", design_rev + 1, cfg.max_design_revisions)
-        revise_out = llm.chat(
-            model=cfg.designer_model,
-            system="You revise UML designs for scientific Python workflows.",
-            user=revise_design_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, FAILURE_REPORT=read_text(os.path.join(task_dir, "last_verification.txt"))),
-        )
+        system_d2 = "You revise UML designs for scientific Python workflows."
+        user_d2 = revise_design_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, FAILURE_REPORT=read_text(os.path.join(task_dir, "last_verification.txt")))
+        log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"designer_revision_{design_rev+1}", system_d2, user_d2)
+        revise_out = llm.chat(model=cfg.designer_model, system=system_d2, user=user_d2)
 
         new_uml = extract_fenced_block(revise_out, "plantuml")
         if new_uml:
-            current_uml = new_uml
-
-            # ---- UML syntax check + auto-repair (after Designer call)
-            current_uml, uml_ok, uml_err = ensure_valid_uml(llm, cfg, requirement_packet, current_uml, puml_path, prompts_dir, global_logger)
-            if uml_ok:
-                ok, err = plantuml_render_png(puml_path, png_path, cfg.plantuml_jar_path, global_logger)
-                if ok:
-                    log("Rendered UML PNG: %s", png_path)
-                else:
-                    log("UML PNG not rendered: %s", err)
+            # Validate UML after every Designer call
+            current_uml, uml_png_ok, uml_err = validate_and_render_uml_with_repair(
+                llm=llm,
+                cfg=cfg,
+                requirement_packet=requirement_packet,
+                prompts_dir=prompts_dir,
+                task_dir=task_dir,
+                task_slug=task_slug,
+                uml_text=new_uml,
+                task_logger=task_logger,
+                run_logger=run_logger,
+            )
+            if uml_png_ok:
+                log("Rendered UML PNG after design revision")
             else:
-                log("UML syntax could not be fixed after retries. Last error: %s", uml_err)
+                log("UML PNG not rendered after design revision: %s", uml_err)
         else:
             write_text(os.path.join(task_dir, f"revise_raw_{design_rev+1}.txt"), revise_out)
             log("Design revision did not return PlantUML; keeping previous UML.")
 
-        # regenerate code using revised UML
+        # Regenerate code
         log("Regenerating code after design revision")
-        coder_out = llm.chat(
-            model=cfg.coder_model,
-            system="You are a professional Python developer specialising in numerical/scientific computing.",
-            user=coder_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, ARCHITECTURE_TEXT=architecture, CONTRACT_TEXT=contract),
-        )
+        system_c2 = "You are a professional Python developer specialising in numerical/scientific computing."
+        user_c2 = coder_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, ARCHITECTURE_TEXT=architecture, CONTRACT_TEXT=contract_txt)
+        log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"coder_after_design_{design_rev+1}", system_c2, user_c2)
+        coder_out = llm.chat(model=cfg.coder_model, system=system_c2, user=user_c2)
         regen = extract_fenced_block(coder_out, "python")
         if regen:
             current_code = regen
@@ -494,42 +550,49 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
 # ----------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="StructGen-style code generation (v1) with UML syntax check + auto-repair")
+    parser = argparse.ArgumentParser(description="StructGen runner v1")
     parser.add_argument("--config", default="structgen_config.json")
     parser.add_argument("--requirements", default="requirements.txt")
     parser.add_argument("--prompts", default="prompts")
     parser.add_argument("--out", default="out")
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--log-prompts", action="store_true", help="Log all prompts (system+user) to task.log and prompts_used/*.txt")
+    parser.add_argument("--log-prompts-include-runlog", action="store_true", help="Also echo prompts into out/run.log")
 
     args = parser.parse_args()
 
     cfg = Config.load(args.config)
     if args.smoke_test:
         cfg.smoke_test = True
+    if args.log_prompts:
+        cfg.log_prompts = True
+    if args.log_prompts_include_runlog:
+        cfg.log_prompts_include_runlog = True
 
     os.makedirs(args.out, exist_ok=True)
-    global_logger = setup_logger(os.path.join(args.out, "run.log"), also_console=True)
+    run_logger = setup_logger(os.path.join(args.out, "run.log"), also_console=True)
 
-    global_logger.info("Starting StructGen runner")
-    global_logger.info("Config: %s", args.config)
-    global_logger.info("Requirements: %s", args.requirements)
-    global_logger.info("Prompts dir: %s", args.prompts)
-    global_logger.info("Output dir: %s", args.out)
-    global_logger.info("Smoke test: %s", cfg.smoke_test)
+    run_logger.info("Starting StructGen runner")
+    run_logger.info("Config: %s", args.config)
+    run_logger.info("Requirements: %s", args.requirements)
+    run_logger.info("Prompts dir: %s", args.prompts)
+    run_logger.info("Output dir: %s", args.out)
+    run_logger.info("Smoke test: %s", cfg.smoke_test)
+    run_logger.info("Log prompts: %s (include run.log: %s)", cfg.log_prompts, cfg.log_prompts_include_runlog)
 
     tasks = parse_tasks(read_text(args.requirements))
-    global_logger.info("Found %d task(s)", len(tasks))
+    run_logger.info("Found %d task(s)", len(tasks))
 
     llm = LLM(cfg)
 
     for i, task in enumerate(tasks, start=1):
-        global_logger.info("Task %d/%d: %s", i, len(tasks), infer_title(task))
+        run_logger.info("Task %d/%d: %s", i, len(tasks), infer_title(task))
         try:
-            run_task(llm, cfg, task, args.prompts, args.out, global_logger)
+            run_task(llm, cfg, task, args.prompts, args.out, run_logger)
         except Exception as e:
-            global_logger.exception("Task failed: %s", e)
+            run_logger.exception("Task failed: %s", e)
 
-    global_logger.info("All tasks processed")
+    run_logger.info("All tasks processed")
     return 0
 
 
