@@ -1,45 +1,24 @@
 **Role: Designer (Revise Design Mode)**
 
-You are given:
-- The requirement packet
-- The previous UML
-- A failure report from verification
+Revise the UML activity diagram + contract to address the failure.
 
-Revise the UML activity diagram and contract to address the failure.
-
-STRICT OUTPUT:
+Rules:
 - Output ONLY:
-  1) ONE ```plantuml``` block with @startuml...@enduml
+  1) one ```plantuml``` activity diagram (@startuml..@enduml)
   2) Architecture bullets
   3) I/O & Verification Contract bullets
-- No additional prose.
+- Keep activity syntax (`start/stop`, `:action;`, `if/endif`, `while/endwhile`).
+- No `->` arrows.
 
 Requirement:
 ```text
 {REQUIREMENT_PACKET}
 ```
-
 Previous UML:
 ```plantuml
 {UML_TEXT}
 ```
-
 Failure report:
 ```text
 {FAILURE_REPORT}
 ```
-
-OUTPUT:
-```plantuml
-@startuml
-start
-' revised activity diagram here
-stop
-@enduml
-```
-
-Architecture:
-- ...
-
-I/O & Verification Contract:
-- ...

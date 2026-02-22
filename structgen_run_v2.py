@@ -1,47 +1,14 @@
 #!/usr/bin/env python3
-"""StructGen-style automated code generation with a lightweight, editable verification DSL.
+"""StructGen-style automated code generation (v2) with UML syntax check + auto-repair and verification DSL.
 
-What this runner does
----------------------
-- Reads *one or more* natural-language tasks from a requirements file.
-  *Default*: requirements.txt
-  *Task separator*: a line containing only '---'
-- Uses a Designer LLM to produce a PlantUML activity diagram + a verification contract.
-- Uses a Coder LLM to generate a single-file Python implementation with entry point:
-      run(input_path, output_path, ...) -> Optional[summary]
-- Iterates using StructGen-style policy:
-  * repair code a few times (UML fixed)
-  * then revise design (UML updated) if still failing
+Compared to v1:
+- Supports a lightweight verification contract DSL in the requirement text using @directives.
+- Uses those directives to run the generated function in a sandbox and apply checks to the output CSV.
 
-Verification DSL (Option B)
----------------------------
-This runner can optionally enforce machine-readable checks embedded in each requirement packet.
-You write contract directives as lines starting with '@', for example:
-
-  @input_file: input_01_sensor.csv
-  @output_file: output.csv
-  @params: window_size=7
-  @output_schema: timestamp,value_raw,value_median,value_denoised
-  @check: columns(timestamp,value_raw,value_median,value_denoised)
-  @check: finite(value_raw,value_denoised)
-  @check: rms(value_denoised) <= rms(value_raw) rel_tol=1e-12
-
-See verifier_rules.md for the full syntax.
-
-Outputs
--------
-For each task, writes to out/<task_slug>/:
-- <task_slug>.puml (PlantUML text)
-- <task_slug>.png (if Java + plantuml.jar are available)
-- <task_slug>.py (generated code)
-- architecture.txt, contract.txt
-- task.log, last_verification.txt
-
-Requirements
-------------
-- Python package: openai (for the OpenAI-compatible client)
-- Optional (for verification beyond basic checks): pandas, numpy
-- Optional (for PNG): Java + plantuml.jar
+UML robustness:
+- Before rendering, performs PlantUML syntax check.
+- If invalid, triggers UML repair with the Designer.
+- Runs syntax-check + repair loop after EVERY Designer call (initial + revisions).
 """
 
 from __future__ import annotations
@@ -63,7 +30,7 @@ from openai import OpenAI
 
 
 # ----------------------------
-# Basic helpers
+# Helpers
 # ----------------------------
 
 def slugify(text: str, max_len: int = 80) -> str:
@@ -122,6 +89,18 @@ def extract_section(text: str, header: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+def load_prompt(prompts_dir: str, filename: str) -> str:
+    path = os.path.join(prompts_dir, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing prompt template: {path}")
+    return read_text(path)
+
+
+def load_prompt_optional(prompts_dir: str, filename: str) -> Optional[str]:
+    path = os.path.join(prompts_dir, filename)
+    return read_text(path) if os.path.exists(path) else None
+
+
 # ----------------------------
 # Config
 # ----------------------------
@@ -141,9 +120,10 @@ class Config:
     max_code_repairs: int = 2
     max_design_revisions: int = 4
 
+    max_uml_repairs: int = 2
+
     plantuml_jar_path: str = "./plantuml.jar"
 
-    # If True, attempt a minimal placeholder call to run() if no @input_file is provided.
     smoke_test: bool = False
 
     @staticmethod
@@ -177,43 +157,103 @@ class LLM:
 
 
 # ----------------------------
-# PlantUML rendering
+# PlantUML: syntax check + render
 # ----------------------------
 
-def render_plantuml_png(puml_path: str, png_path: str, plantuml_jar_path: str, logger: logging.Logger) -> bool:
+def plantuml_check(puml_path: str, plantuml_jar_path: str) -> Tuple[bool, str]:
     if not os.path.exists(plantuml_jar_path):
-        logger.warning("PlantUML jar not found at %s; skipping PNG render.", plantuml_jar_path)
-        return False
+        return False, f"PlantUML jar not found at {plantuml_jar_path}"
+    try:
+        cmd = ["java", "-jar", plantuml_jar_path, "-checkonly", "-failonerror", puml_path]
+        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if cp.returncode != 0:
+            err = (cp.stderr or cp.stdout or "").strip()
+            if not err:
+                err = "PlantUML syntax check failed (non-zero exit code)."
+            return False, err
+        return True, ""
+    except FileNotFoundError:
+        return False, "Java not found on PATH (install Java to enable UML checking/rendering)."
 
+
+def plantuml_render_png(puml_path: str, png_path: str, plantuml_jar_path: str, logger: logging.Logger) -> Tuple[bool, str]:
+    if not os.path.exists(plantuml_jar_path):
+        return False, f"PlantUML jar not found at {plantuml_jar_path}"
     out_dir = os.path.dirname(png_path)
     os.makedirs(out_dir, exist_ok=True)
-
     try:
-        cmd = ["java", "-jar", plantuml_jar_path, "-tpng", puml_path, "-o", out_dir]
+        cmd = ["java", "-jar", plantuml_jar_path, "-failonerror", "-noerror", "-tpng", puml_path, "-o", out_dir]
         logger.info("PlantUML render: %s", " ".join(cmd))
-        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-
+        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if cp.returncode != 0:
+            err = (cp.stderr or cp.stdout or "").strip()
+            if not err:
+                err = "PlantUML render failed (non-zero exit code)."
+            return False, err
         base = os.path.splitext(os.path.basename(puml_path))[0]
         produced = os.path.join(out_dir, base + ".png")
         if os.path.exists(produced):
             if os.path.abspath(produced) != os.path.abspath(png_path):
                 shutil.move(produced, png_path)
-            return True
-
-        logger.warning("PlantUML did not produce expected PNG: %s", produced)
-        return False
-
+            return True, ""
+        return False, "PlantUML did not produce an output PNG."
     except FileNotFoundError:
-        logger.warning("Java not found; cannot render PNG.")
-        return False
-    except subprocess.CalledProcessError as e:
-        err = (e.stderr or "").strip()
-        logger.warning("PlantUML render failed: %s", err[-1500:] if err else str(e))
-        return False
+        return False, "Java not found on PATH (install Java to enable PNG rendering)."
+
+
+def build_repair_uml_prompt(requirement_packet: str, uml_text: str, plantuml_error: str, template: Optional[str]) -> str:
+    if template:
+        return template.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=uml_text, PLANTUML_ERROR=plantuml_error)
+    return (
+        "Role: Designer (UML Repair Mode)\n\n"
+        "PlantUML reported syntax errors for the following ACTIVITY DIAGRAM.\n"
+        "Fix ONLY the PlantUML syntax so it renders. Do NOT switch diagram types.\n"
+        "Use activity syntax: start/stop, :actions;, if/endif, while/endwhile, repeat/repeat while.\n"
+        "Do NOT use arrows (->), do/end while, or missing semicolons on actions.\n\n"
+        "PlantUML error:\n"
+        f"{plantuml_error}\n\n"
+        "Requirement packet:\n"
+        f"{requirement_packet}\n\n"
+        "Previous UML:\n"
+        f"```plantuml\n{uml_text}\n```\n\n"
+        "STRICT OUTPUT: Output ONLY one fenced ```plantuml``` block containing a valid activity diagram.\n"
+    )
+
+
+def ensure_valid_uml(llm: LLM, cfg: Config, requirement_packet: str, uml_text: str, puml_path: str, prompts_dir: str, logger: logging.Logger) -> Tuple[str, bool, str]:
+    repair_tpl = load_prompt_optional(prompts_dir, "repair_uml.md")
+    current = uml_text
+    last_err = ""
+
+    for attempt in range(cfg.max_uml_repairs + 1):
+        write_text(puml_path, current + "\n")
+        ok, err = plantuml_check(puml_path, cfg.plantuml_jar_path)
+        if ok:
+            return current, True, ""
+
+        last_err = err
+        logger.info("UML syntax check failed (attempt %d/%d): %s", attempt + 1, cfg.max_uml_repairs + 1, err)
+        if attempt >= cfg.max_uml_repairs:
+            break
+
+        prompt = build_repair_uml_prompt(requirement_packet, current, err, repair_tpl)
+        repair_out = llm.chat(
+            model=cfg.designer_model,
+            system="You repair PlantUML activity diagrams to be syntactically valid.",
+            user=prompt,
+        )
+        repaired = extract_fenced_block(repair_out, "plantuml")
+        if repaired:
+            current = repaired
+        else:
+            write_text(os.path.join(os.path.dirname(puml_path), f"uml_repair_raw_{attempt+1}.txt"), repair_out)
+            break
+
+    return current, False, last_err
 
 
 # ----------------------------
-# Verification DSL parsing
+# Verification DSL
 # ----------------------------
 
 @dataclass
@@ -232,71 +272,53 @@ class Contract:
 
 
 def _parse_value(s: str) -> Any:
-    """Parse simple literals: int, float, bool, None, or quoted string. Fallback to raw string."""
     s = s.strip()
     if not s:
         return ""
-    # Allow unquoted words like not-a-knot
     try:
         return ast.literal_eval(s)
     except Exception:
-        # recognise true/false/none case-insensitively
         low = s.lower()
         if low == "true":
             return True
         if low == "false":
             return False
-        if low == "none" or low == "null":
+        if low in ("none", "null"):
             return None
-        # strip optional surrounding quotes manually
         if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
             return s[1:-1]
         return s
 
 
 def parse_contract(requirement_packet: str) -> Contract:
-    """Extract @directives embedded in the requirement packet."""
     c = Contract()
     for raw in requirement_packet.splitlines():
         line = raw.strip()
         if not line.startswith("@"):  # only directives
             continue
-
-        # Format: @key: value
         m = re.match(r"^@([a-zA-Z_]+)\s*:\s*(.*)$", line)
         if not m:
             continue
-
         key = m.group(1).lower()
         val = m.group(2).strip()
-
         if key == "input_file":
             c.input_file = val
         elif key == "output_file":
             c.output_file = val
         elif key == "output_schema":
-            cols = [x.strip() for x in val.split(",") if x.strip()]
-            c.output_schema = cols
+            c.output_schema = [x.strip() for x in val.split(",") if x.strip()]
         elif key == "params":
-            # comma-separated key=value list
-            # example: window_size=7, dt=0.5
             parts = [p.strip() for p in val.split(",") if p.strip()]
             for p in parts:
-                if "=" not in p:
-                    continue
-                k, v = p.split("=", 1)
-                c.params[k.strip()] = _parse_value(v)
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    c.params[k.strip()] = _parse_value(v)
         elif key == "check":
             c.checks.append(val)
-
     return c
 
 
-# ----------------------------
-# Verification engine
-# ----------------------------
-
-def _require_numpy_pandas() -> Tuple[Any, Any]:
+def _require_numpy_pandas():
     try:
         import numpy as np  # type: ignore
         import pandas as pd  # type: ignore
@@ -309,19 +331,7 @@ def _require_numpy_pandas() -> Tuple[Any, Any]:
 
 
 def _eval_expr(expr: str, df, np) -> float:
-    """Evaluate a small numeric expression.
-
-    Supported:
-      - numeric literals (e.g., 1, 0.5)
-      - mean(col), std(col), min(col), max(col), rms(col)
-      - count()  (number of rows)
-      - unique(col) (number of unique values)
-
-    Column name parsing is conservative: characters [A-Za-z0-9_].
-    """
     expr = expr.strip()
-
-    # numeric literal
     try:
         return float(expr)
     except Exception:
@@ -354,7 +364,6 @@ def _eval_expr(expr: str, df, np) -> float:
 
 
 def _parse_kwargs(tokens: List[str]) -> Tuple[List[str], Dict[str, Any]]:
-    """Split end-of-line key=value tokens into kwargs."""
     kwargs: Dict[str, Any] = {}
     rest = tokens[:]
     while rest and "=" in rest[-1]:
@@ -365,16 +374,6 @@ def _parse_kwargs(tokens: List[str]) -> Tuple[List[str], Dict[str, Any]]:
 
 
 def _run_checks(checks: List[str], output_path: str, contract: Contract) -> Tuple[bool, str]:
-    """Run checks described by @check directives.
-
-    Current check forms:
-      - columns(col1,col2,...)
-      - finite(col1,col2,...)   (all finite, no NaN/Inf)
-      - <expr> <op> <expr> [abs_tol=...] [rel_tol=...]
-        where op in: <= >= < > == != ~=  (approx)
-
-    The output is assumed to be CSV (for now).
-    """
     np, pd = _require_numpy_pandas()
 
     if not os.path.exists(output_path):
@@ -385,7 +384,6 @@ def _run_checks(checks: List[str], output_path: str, contract: Contract) -> Tupl
     except Exception as e:
         return False, f"Failed to read output CSV '{output_path}': {e}"
 
-    # optional schema directive
     if contract.output_schema:
         missing = [c for c in contract.output_schema if c not in df.columns]
         if missing:
@@ -396,7 +394,6 @@ def _run_checks(checks: List[str], output_path: str, contract: Contract) -> Tupl
         if not line:
             continue
 
-        # columns(...)
         m = re.match(r"^columns\((.*?)\)$", line)
         if m:
             cols = [x.strip() for x in m.group(1).split(",") if x.strip()]
@@ -405,7 +402,6 @@ def _run_checks(checks: List[str], output_path: str, contract: Contract) -> Tupl
                 return False, f"Check failed: missing columns {missing}"
             continue
 
-        # finite(...)
         m = re.match(r"^finite\((.*?)\)$", line)
         if m:
             cols = [x.strip() for x in m.group(1).split(",") if x.strip()]
@@ -417,12 +413,10 @@ def _run_checks(checks: List[str], output_path: str, contract: Contract) -> Tupl
                     return False, f"Check failed: column '{c}' contains NaN/Inf"
             continue
 
-        # expression comparison checks
         tokens = line.split()
         tokens2, kwargs = _parse_kwargs(tokens)
         cmp_str = " ".join(tokens2)
 
-        # find operator
         ops = ["~=", "<=", ">=", "==", "!=", "<", ">"]
         op_found = None
         left = right = None
@@ -459,7 +453,6 @@ def _run_checks(checks: List[str], output_path: str, contract: Contract) -> Tupl
         elif op_found == "!=":
             ok = lv != rv
         elif op_found == "~=":
-            # approx equality
             ok = abs(lv - rv) <= abs_tol + rel_tol * abs(rv)
 
         if not ok:
@@ -468,26 +461,12 @@ def _run_checks(checks: List[str], output_path: str, contract: Contract) -> Tupl
     return True, "All contract checks passed."
 
 
-def verify_generated_code(
-    code: str,
-    requirement_packet: str,
-    requirements_path: str,
-    smoke_test: bool,
-    logger: logging.Logger,
-) -> Tuple[bool, str]:
-    """Verify code using either:
-
-    - Contract-based checks (@directives) if present and an input file is provided
-    - Otherwise minimal verification (compile + load + run present), and optionally a smoke test.
-    """
-
-    # compile
+def verify_generated_code(code: str, requirement_packet: str, requirements_path: str, smoke_test: bool) -> Tuple[bool, str]:
     try:
         compiled = compile(code, "<generated>", "exec")
     except Exception as e:
         return False, f"Compilation error: {e}"
 
-    # exec
     ns: Dict[str, Any] = {}
     try:
         exec(compiled, ns, ns)
@@ -500,15 +479,12 @@ def verify_generated_code(
 
     contract = parse_contract(requirement_packet)
 
-    # If contract has no checks and no input file, fall back to minimal
     if (not contract.checks) and (not contract.input_file):
         if not smoke_test:
             return True, "Basic verification passed (compile + load + run present)."
 
-    # Create a sandbox temp dir and resolve input/output
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            # Resolve input file
             if contract.input_file:
                 req_dir = os.path.dirname(os.path.abspath(requirements_path))
                 src = os.path.join(req_dir, contract.input_file)
@@ -517,30 +493,23 @@ def verify_generated_code(
                 input_path = os.path.join(tmp, os.path.basename(contract.input_file))
                 shutil.copyfile(src, input_path)
             else:
-                # placeholder file for smoke-test path
                 input_path = os.path.join(tmp, "input_placeholder")
                 with open(input_path, "wb") as f:
                     f.write(b"")
 
-            # Resolve output
             out_name = contract.output_file or "output.csv"
             output_path = os.path.join(tmp, out_name)
 
-            # Run
             try:
-                # only pass params declared in @params
                 run_fn(input_path, output_path, **(contract.params or {}))
             except TypeError as e:
                 return False, f"Run invocation failed (parameter mismatch). Error: {e}"
             except Exception as e:
                 return False, f"Run execution raised an exception: {e}"
 
-            # If we have contract checks, run them
             if contract.checks or contract.output_schema:
-                ok, report = _run_checks(contract.checks or [], output_path, contract)
-                return ok, report
+                return _run_checks(contract.checks or [], output_path, contract)
 
-            # Otherwise, if smoke_test is enabled, at least check output file exists
             if smoke_test:
                 if not os.path.exists(output_path):
                     return False, "Smoke-test: output file was not created."
@@ -575,22 +544,7 @@ def setup_logger(log_path: str, also_console: bool = True) -> logging.Logger:
     return logger
 
 
-def load_prompt(prompts_dir: str, filename: str) -> str:
-    path = os.path.join(prompts_dir, filename)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Missing prompt template: {path}")
-    return read_text(path)
-
-
-def run_task(
-    llm: LLM,
-    cfg: Config,
-    requirement_packet: str,
-    requirements_path: str,
-    prompts_dir: str,
-    out_dir: str,
-    global_logger: logging.Logger,
-) -> None:
+def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: str, prompts_dir: str, out_dir: str, logger: logging.Logger) -> None:
     title = infer_title(requirement_packet)
     task_slug = slugify(title)
     task_dir = os.path.join(out_dir, task_slug)
@@ -599,17 +553,17 @@ def run_task(
     task_logger = setup_logger(os.path.join(task_dir, "task.log"), also_console=False)
 
     def log(msg: str, *args: Any) -> None:
-        global_logger.info("[%s] " + msg, task_slug, *args)
+        logger.info("[%s] " + msg, task_slug, *args)
         task_logger.info(msg, *args)
-
-    log("=== Task started: %s ===", title)
 
     designer_tpl = load_prompt(prompts_dir, "designer_plantuml.md")
     coder_tpl = load_prompt(prompts_dir, "coder_python.md")
-    repair_tpl = load_prompt(prompts_dir, "repair_code.md")
-    revise_tpl = load_prompt(prompts_dir, "revise_design.md")
+    repair_code_tpl = load_prompt(prompts_dir, "repair_code.md")
+    revise_design_tpl = load_prompt(prompts_dir, "revise_design.md")
 
-    # ---- Design
+    log("=== Task started: %s ===", title)
+
+    # ---- Designer call #1
     log("Calling Designer model: %s", cfg.designer_model)
     designer_out = llm.chat(
         model=cfg.designer_model,
@@ -623,31 +577,31 @@ def run_task(
         raise RuntimeError("Designer did not produce a PlantUML fenced block. See designer_raw.txt")
 
     architecture = extract_section(designer_out, "Architecture:")
-    contract = extract_section(designer_out, "I/O & Verification Contract:")
+    contract_txt = extract_section(designer_out, "I/O & Verification Contract:")
 
     puml_path = os.path.join(task_dir, f"{task_slug}.puml")
-    write_text(puml_path, uml + "\n")
-
     png_path = os.path.join(task_dir, f"{task_slug}.png")
-    render_plantuml_png(puml_path, png_path, cfg.plantuml_jar_path, global_logger)
+
+    # ---- UML syntax check + auto-repair (after Designer call)
+    uml, uml_ok, uml_err = ensure_valid_uml(llm, cfg, requirement_packet, uml, puml_path, prompts_dir, logger)
+    if uml_ok:
+        ok, err = plantuml_render_png(puml_path, png_path, cfg.plantuml_jar_path, logger)
+        if ok:
+            log("Rendered UML PNG: %s", png_path)
+        else:
+            log("UML PNG not rendered: %s", err)
+    else:
+        log("UML syntax could not be fixed after retries. Last error: %s", uml_err)
 
     write_text(os.path.join(task_dir, "architecture.txt"), architecture + "\n")
-    write_text(os.path.join(task_dir, "contract.txt"), contract + "\n")
+    write_text(os.path.join(task_dir, "contract.txt"), contract_txt + "\n")
 
     # ---- Code generation
-    def coder_prompt_for(u: str, a: str, c: str) -> str:
-        return coder_tpl.format(
-            REQUIREMENT_PACKET=requirement_packet,
-            UML_TEXT=u,
-            ARCHITECTURE_TEXT=a,
-            CONTRACT_TEXT=c,
-        )
-
     log("Calling Coder model: %s", cfg.coder_model)
     coder_out = llm.chat(
         model=cfg.coder_model,
         system="You are a professional Python developer specialising in numerical/scientific computing.",
-        user=coder_prompt_for(uml, architecture, contract),
+        user=coder_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=uml, ARCHITECTURE_TEXT=architecture, CONTRACT_TEXT=contract_txt),
     )
 
     code = extract_fenced_block(coder_out, "python")
@@ -657,19 +611,11 @@ def run_task(
 
     current_code = code
     current_uml = uml
-    current_arch = architecture
-    current_contract = contract
 
     # ---- Iteration
     for design_rev in range(cfg.max_design_revisions + 1):
         for repair in range(cfg.max_code_repairs + 1):
-            ok, report = verify_generated_code(
-                current_code,
-                requirement_packet,
-                requirements_path,
-                cfg.smoke_test,
-                global_logger,
-            )
+            ok, report = verify_generated_code(current_code, requirement_packet, requirements_path, cfg.smoke_test)
             write_text(os.path.join(task_dir, "last_verification.txt"), report + "\n")
             log("Verification: %s", "PASS" if ok else "FAIL")
             log("Verification report: %s", report)
@@ -688,12 +634,7 @@ def run_task(
             repair_out = llm.chat(
                 model=cfg.coder_model,
                 system="You repair scientific Python code based on verification feedback.",
-                user=repair_tpl.format(
-                    REQUIREMENT_PACKET=requirement_packet,
-                    UML_TEXT=current_uml,
-                    PREV_CODE=current_code,
-                    FAILURE_REPORT=report,
-                ),
+                user=repair_code_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, PREV_CODE=current_code, FAILURE_REPORT=report),
             )
             repaired = extract_fenced_block(repair_out, "python")
             if repaired:
@@ -707,36 +648,37 @@ def run_task(
             write_text(py_path, current_code + "\n")
             return
 
+        # ---- Designer call (design revision)
         log("Revising design (attempt %d/%d)", design_rev + 1, cfg.max_design_revisions)
         revise_out = llm.chat(
             model=cfg.designer_model,
             system="You revise UML designs for scientific Python workflows.",
-            user=revise_tpl.format(
-                REQUIREMENT_PACKET=requirement_packet,
-                UML_TEXT=current_uml,
-                FAILURE_REPORT=read_text(os.path.join(task_dir, "last_verification.txt")),
-            ),
+            user=revise_design_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, FAILURE_REPORT=read_text(os.path.join(task_dir, "last_verification.txt"))),
         )
 
         new_uml = extract_fenced_block(revise_out, "plantuml")
         if new_uml:
             current_uml = new_uml
-            current_arch = extract_section(revise_out, "Architecture:") or current_arch
-            current_contract = extract_section(revise_out, "I/O & Verification Contract:") or current_contract
-            write_text(puml_path, current_uml + "\n")
-            write_text(os.path.join(task_dir, "architecture.txt"), current_arch + "\n")
-            write_text(os.path.join(task_dir, "contract.txt"), current_contract + "\n")
-            render_plantuml_png(puml_path, png_path, cfg.plantuml_jar_path, global_logger)
+
+            # ---- UML syntax check + auto-repair (after Designer call)
+            current_uml, uml_ok, uml_err = ensure_valid_uml(llm, cfg, requirement_packet, current_uml, puml_path, prompts_dir, logger)
+            if uml_ok:
+                ok, err = plantuml_render_png(puml_path, png_path, cfg.plantuml_jar_path, logger)
+                if ok:
+                    log("Rendered UML PNG: %s", png_path)
+                else:
+                    log("UML PNG not rendered: %s", err)
+            else:
+                log("UML syntax could not be fixed after retries. Last error: %s", uml_err)
         else:
             write_text(os.path.join(task_dir, f"revise_raw_{design_rev+1}.txt"), revise_out)
             log("Design revision did not return PlantUML; keeping previous UML.")
 
-        # Regenerate code after design revision
         log("Regenerating code after design revision")
         coder_out = llm.chat(
             model=cfg.coder_model,
             system="You are a professional Python developer specialising in numerical/scientific computing.",
-            user=coder_prompt_for(current_uml, current_arch, current_contract),
+            user=coder_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, ARCHITECTURE_TEXT=architecture, CONTRACT_TEXT=contract_txt),
         )
         regen = extract_fenced_block(coder_out, "python")
         if regen:
@@ -750,12 +692,12 @@ def run_task(
 # ----------------------------
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="StructGen-style code generation using Ollama + PlantUML + verification DSL")
-    parser.add_argument("--config", default="structgen_config.json", help="Path to structgen_config.json")
-    parser.add_argument("--requirements", default="requirements.txt", help="Path to requirements file")
-    parser.add_argument("--prompts", default="prompts", help="Directory containing prompt templates")
-    parser.add_argument("--out", default="out", help="Output directory")
-    parser.add_argument("--smoke-test", action="store_true", help="Enable placeholder run() call when no @input_file is provided")
+    parser = argparse.ArgumentParser(description="StructGen-style code generation (v2) with UML syntax check + auto-repair")
+    parser.add_argument("--config", default="structgen_config.json")
+    parser.add_argument("--requirements", default="requirements.txt")
+    parser.add_argument("--prompts", default="prompts")
+    parser.add_argument("--out", default="out")
+    parser.add_argument("--smoke-test", action="store_true")
 
     args = parser.parse_args()
 
@@ -766,14 +708,13 @@ def main() -> int:
     os.makedirs(args.out, exist_ok=True)
     logger = setup_logger(os.path.join(args.out, "run.log"), also_console=True)
 
-    logger.info("Starting StructGen runner (with verification DSL)")
+    logger.info("Starting StructGen runner (v2)")
     logger.info("Requirements: %s", args.requirements)
     logger.info("Prompts dir: %s", args.prompts)
     logger.info("Output dir: %s", args.out)
     logger.info("Smoke test: %s", cfg.smoke_test)
 
-    req_text = read_text(args.requirements)
-    tasks = parse_tasks(req_text)
+    tasks = parse_tasks(read_text(args.requirements))
     logger.info("Found %d task(s)", len(tasks))
 
     llm = LLM(cfg)
