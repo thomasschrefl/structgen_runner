@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""StructGen runner v1 (minimal verifier) with:
-- PlantUML syntax-check + UML auto-repair after EVERY Designer call
-- Optional logging of all prompts (system+user) used in the run
+"""StructGen runner v1 (minimal verification) with:
 
-CLI:
-  python structgen_run.py [--requirements requirements.txt] [--prompts prompts] [--out out]
-                         [--config structgen_config.json] [--smoke-test]
-                         [--log-prompts] [--log-prompts-include-runlog]
+1) UML robustness
+   - Runs PlantUML syntax check (-checkonly -failonerror) before rendering.
+   - If UML has syntax errors, triggers a Designer "UML Repair" loop.
+   - This runs after EVERY Designer call (initial + design revisions).
 
-Prompt logging (disabled by default):
-- When enabled, all prompts are written to out/<task>/prompts_used/*.txt
-- Also logged into out/<task>/task.log.
-- If --log-prompts-include-runlog is set, prompts are additionally echoed into out/run.log.
+2) Prompt length guardrail (auto-compress + continue)
+   - Estimates prompt tokens (heuristic) and if above a budget, automatically compresses the
+     largest inputs (requirement packet, UML, contract) using a summariser call.
+   - Continues execution but issues a WARNING.
 
-Note: logging prompts may leak sensitive content. Use only in trusted environments.
+3) Optional logging of all prompts used
+   - When enabled, writes prompts to out/<task>/prompts_used/*.txt and task.log.
+   - Optionally also echoes into out/run.log.
+
+WARNING: Logging prompts may expose sensitive content. Use only in trusted environments.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,7 +38,7 @@ from openai import OpenAI
 
 
 # ----------------------------
-# Helpers
+# Utilities
 # ----------------------------
 
 def slugify(text: str, max_len: int = 80) -> str:
@@ -78,7 +81,7 @@ def infer_title(requirement_packet: str) -> str:
         return m.group(1).strip()
     for line in requirement_packet.splitlines():
         if line.strip():
-            return line.strip()[:60]
+            return line.strip()[:80]
     return "Untitled Task"
 
 
@@ -131,11 +134,13 @@ def setup_logger(log_path: str, also_console: bool = True) -> logging.Logger:
 
 @dataclass
 class Config:
+    # Ollama / OpenAI-compatible
     ollama_base_url: str = "http://localhost:11434/v1"
     ollama_api_key: str = "ollama"
 
     designer_model: str = "qwen2.5-coder:7b-instruct"
     coder_model: str = "qwen2.5-coder:7b-instruct"
+    summarizer_model: str = ""  # optional override; if empty uses designer_model
 
     temperature: float = 0.2
     top_p: float = 0.95
@@ -143,16 +148,21 @@ class Config:
 
     max_code_repairs: int = 2
     max_design_revisions: int = 4
-
     max_uml_repairs: int = 2
 
     plantuml_jar_path: str = "./plantuml.jar"
 
     smoke_test: bool = False
 
-    # NEW: prompt logging
+    # Prompt logging
     log_prompts: bool = False
     log_prompts_include_runlog: bool = False
+
+    # Prompt length guardrail
+    prompt_length_check: bool = True
+    prompt_token_budget: int = 5500  # estimated tokens for (system+user). Leave headroom.
+    prompt_estimator: str = "chars_div_4"  # chars_div_4 | words_1p3
+    compress_target_tokens: int = 2500      # target for each long component
 
     @staticmethod
     def load(path: str) -> "Config":
@@ -165,7 +175,7 @@ class Config:
 
 
 # ----------------------------
-# LLM Client
+# LLM client
 # ----------------------------
 
 class LLM:
@@ -215,14 +225,98 @@ def log_prompt_bundle(
     )
     write_text(path, blob)
 
-    # Always include in task.log
     task_logger.info("PROMPT_SAVED: %s", path)
-    task_logger.info("PROMPT_BEGIN %s\n%s\nPROMPT_END %s", tag, blob, tag)
 
-    # Optionally include in global run.log
     if include_runlog:
         run_logger.info("PROMPT_SAVED: %s", path)
-        run_logger.info("PROMPT_BEGIN %s\n%s\nPROMPT_END %s", tag, blob, tag)
+
+
+# ----------------------------
+# Prompt length guardrail (estimate + compress)
+# ----------------------------
+
+def estimate_tokens(text: str, method: str) -> int:
+    if not text:
+        return 0
+    if method == "words_1p3":
+        return int(len(text.split()) * 1.3)
+    # default chars_div_4
+    return max(1, len(text) // 4)
+
+
+def needs_compress(cfg: Config, system_prompt: str, user_prompt: str) -> Tuple[bool, int]:
+    if not cfg.prompt_length_check:
+        return False, 0
+    est = estimate_tokens(system_prompt, cfg.prompt_estimator) + estimate_tokens(user_prompt, cfg.prompt_estimator)
+    return est > cfg.prompt_token_budget, est
+
+
+def summarise_text(llm: LLM, cfg: Config, text: str, target_tokens: int, purpose: str, task_logger: logging.Logger) -> str:
+    # Hard safeguard: if the text itself is enormous, truncate before asking for summarisation.
+    max_chars = target_tokens * 6  # generous; heuristic
+    truncated = text
+    if len(text) > max_chars * 8:
+        truncated = text[: max_chars * 8]
+        task_logger.warning("Prompt too long for summariser; truncating input before summarising (%s).", purpose)
+
+    model = cfg.summarizer_model.strip() or cfg.designer_model
+    system_p = "You compress technical instructions without losing constraints."
+    user_p = (
+        f"Compress the following content to <= {target_tokens} tokens (roughly).\n"
+        "Preserve: function signature, I/O schema, constraints, allowed libraries, determinism rules, and any '@' directives.\n"
+        "Remove: redundancy, long prose, examples unless essential.\n\n"
+        f"PURPOSE: {purpose}\n\n"
+        f"CONTENT:\n{textwrap.shorten(truncated, width=len(truncated), placeholder='')}"
+    )
+    # We do not log this prompt unless prompt logging is on; it uses the same mechanism upstream.
+    out = llm.chat(model=model, system=system_p, user=user_p)
+    # Keep the result as plain text
+    return out.strip()
+
+
+def auto_compress_prompts(
+    llm: LLM,
+    cfg: Config,
+    system_prompt: str,
+    user_prompt: str,
+    components: Dict[str, str],
+    task_logger: logging.Logger,
+) -> Tuple[str, str, bool, int]:
+    """Compress specified components and rebuild user prompt.
+
+    components: mapping name->text for large blocks that can be compressed.
+    The function replaces each block by a compressed version if present.
+    """
+    too_long, est = needs_compress(cfg, system_prompt, user_prompt)
+    if not too_long:
+        return system_prompt, user_prompt, False, est
+
+    task_logger.warning(
+        "Estimated prompt tokens (%d) exceed budget (%d). Auto-compressing and continuing.",
+        est,
+        cfg.prompt_token_budget,
+    )
+
+    new_user = user_prompt
+    for name, original in components.items():
+        if not original:
+            continue
+        comp = summarise_text(llm, cfg, original, cfg.compress_target_tokens, purpose=name, task_logger=task_logger)
+        # Replace only if the original occurs verbatim; otherwise append a compressed appendix.
+        if original in new_user:
+            new_user = new_user.replace(original, comp)
+        else:
+            new_user += f"\n\n[COMPRESSED_{name}]\n{comp}\n"
+
+    # If still too long, final fallback: trim user prompt tail.
+    too_long2, est2 = needs_compress(cfg, system_prompt, new_user)
+    if too_long2:
+        keep = int(cfg.prompt_token_budget * 4)  # chars
+        task_logger.warning("Prompt still too long after compression (est=%d). Truncating user prompt tail.", est2)
+        new_user = new_user[:keep] + "\n\n[TRUNCATED_FOR_BUDGET]"
+        est2 = estimate_tokens(system_prompt, cfg.prompt_estimator) + estimate_tokens(new_user, cfg.prompt_estimator)
+
+    return system_prompt, new_user, True, est2
 
 
 # ----------------------------
@@ -300,8 +394,6 @@ def validate_and_render_uml_with_repair(
     task_logger: logging.Logger,
     run_logger: logging.Logger,
 ) -> Tuple[str, bool, str]:
-    """Syntax-check UML first, trigger repair, then render PNG."""
-
     repair_uml_tpl = load_prompt_optional(prompts_dir, "repair_uml.md")
 
     puml_path = os.path.join(task_dir, f"{task_slug}.puml")
@@ -320,9 +412,14 @@ def validate_and_render_uml_with_repair(
             if attempt >= cfg.max_uml_repairs:
                 return current_uml, False, last_err
 
-            # Ask Designer to repair UML
             system_p = "You repair PlantUML activity diagrams to be syntactically valid."
             user_p = build_repair_uml_prompt(requirement_packet, current_uml, err, repair_uml_tpl)
+            # prompt guardrail
+            system_p, user_p, _, _ = auto_compress_prompts(
+                llm, cfg, system_p, user_p,
+                components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": current_uml},
+                task_logger=task_logger,
+            )
             log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_repair_uml", system_p, user_p)
             repair_out = llm.chat(model=cfg.designer_model, system=system_p, user=user_p)
             repaired = extract_fenced_block(repair_out, "plantuml")
@@ -343,6 +440,11 @@ def validate_and_render_uml_with_repair(
 
         system_p = "You repair PlantUML activity diagrams to be syntactically valid."
         user_p = build_repair_uml_prompt(requirement_packet, current_uml, err, repair_uml_tpl)
+        system_p, user_p, _, _ = auto_compress_prompts(
+            llm, cfg, system_p, user_p,
+            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": current_uml},
+            task_logger=task_logger,
+        )
         log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_repair_uml_after_render", system_p, user_p)
         repair_out = llm.chat(model=cfg.designer_model, system=system_p, user=user_p)
         repaired = extract_fenced_block(repair_out, "plantuml")
@@ -419,10 +521,19 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
     repair_code_tpl = load_prompt(prompts_dir, "repair_code.md")
     revise_design_tpl = load_prompt(prompts_dir, "revise_design.md")
 
-    # ---- Designer (initial)
+    # ---- Designer initial
     log("Calling Designer model: %s", cfg.designer_model)
     system_p = "You are a careful software designer for scientific Python."
     user_p = designer_tpl.format(REQUIREMENT_PACKET=requirement_packet)
+
+    system_p, user_p, compressed, est = auto_compress_prompts(
+        llm, cfg, system_p, user_p,
+        components={"REQUIREMENT_PACKET": requirement_packet},
+        task_logger=task_logger,
+    )
+    if compressed:
+        task_logger.warning("Designer prompt auto-compressed (est_tokens_after=%d).", est)
+
     log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_initial", system_p, user_p)
     designer_out = llm.chat(model=cfg.designer_model, system=system_p, user=user_p)
 
@@ -434,19 +545,11 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
     architecture = extract_section(designer_out, "Architecture:")
     contract_txt = extract_section(designer_out, "I/O & Verification Contract:")
 
-    # ---- UML syntax-check + repair + render
-    uml, uml_png_ok, uml_err = validate_and_render_uml_with_repair(
-        llm=llm,
-        cfg=cfg,
-        requirement_packet=requirement_packet,
-        prompts_dir=prompts_dir,
-        task_dir=task_dir,
-        task_slug=task_slug,
-        uml_text=uml,
-        task_logger=task_logger,
-        run_logger=run_logger,
+    # ---- Validate UML after designer call
+    uml, uml_ok, uml_err = validate_and_render_uml_with_repair(
+        llm, cfg, requirement_packet, prompts_dir, task_dir, task_slug, uml, task_logger, run_logger
     )
-    if uml_png_ok:
+    if uml_ok:
         log("Rendered UML PNG")
     else:
         log("UML PNG not rendered: %s", uml_err)
@@ -454,10 +557,23 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
     write_text(os.path.join(task_dir, "architecture.txt"), architecture + "\n")
     write_text(os.path.join(task_dir, "contract.txt"), contract_txt + "\n")
 
-    # ---- Coder
+    # ---- Coder initial
     log("Calling Coder model: %s", cfg.coder_model)
     system_c = "You are a professional Python developer specialising in numerical/scientific computing."
-    user_c = coder_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=uml, ARCHITECTURE_TEXT=architecture, CONTRACT_TEXT=contract_txt)
+    user_c = coder_tpl.format(
+        REQUIREMENT_PACKET=requirement_packet,
+        UML_TEXT=uml,
+        ARCHITECTURE_TEXT=architecture,
+        CONTRACT_TEXT=contract_txt,
+    )
+    system_c, user_c, compressed, est = auto_compress_prompts(
+        llm, cfg, system_c, user_c,
+        components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml, "CONTRACT_TEXT": contract_txt},
+        task_logger=task_logger,
+    )
+    if compressed:
+        task_logger.warning("Coder prompt auto-compressed (est_tokens_after=%d).", est)
+
     log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "coder_initial", system_c, user_c)
     coder_out = llm.chat(model=cfg.coder_model, system=system_c, user=user_c)
 
@@ -486,9 +602,23 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
             if repair >= cfg.max_code_repairs:
                 break
 
+            # ---- Code repair
             log("Repairing code (attempt %d/%d)", repair + 1, cfg.max_code_repairs)
             system_r = "You repair scientific Python code based on verification feedback."
-            user_r = repair_code_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, PREV_CODE=current_code, FAILURE_REPORT=report)
+            user_r = repair_code_tpl.format(
+                REQUIREMENT_PACKET=requirement_packet,
+                UML_TEXT=current_uml,
+                PREV_CODE=current_code,
+                FAILURE_REPORT=report,
+            )
+            system_r, user_r, compressed, est = auto_compress_prompts(
+                llm, cfg, system_r, user_r,
+                components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": current_uml},
+                task_logger=task_logger,
+            )
+            if compressed:
+                task_logger.warning("Repair prompt auto-compressed (est_tokens_after=%d).", est)
+
             log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"coder_repair_{repair+1}", system_r, user_r)
             repair_out = llm.chat(model=cfg.coder_model, system=system_r, user=user_r)
             repaired = extract_fenced_block(repair_out, "python")
@@ -503,28 +633,31 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
             write_text(py_path, current_code + "\n")
             return
 
-        # ---- Designer (revise design)
+        # ---- Design revision (Designer)
         log("Revising design (attempt %d/%d)", design_rev + 1, cfg.max_design_revisions)
         system_d2 = "You revise UML designs for scientific Python workflows."
-        user_d2 = revise_design_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, FAILURE_REPORT=read_text(os.path.join(task_dir, "last_verification.txt")))
+        user_d2 = revise_design_tpl.format(
+            REQUIREMENT_PACKET=requirement_packet,
+            UML_TEXT=current_uml,
+            FAILURE_REPORT=read_text(os.path.join(task_dir, "last_verification.txt")),
+        )
+        system_d2, user_d2, compressed, est = auto_compress_prompts(
+            llm, cfg, system_d2, user_d2,
+            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": current_uml},
+            task_logger=task_logger,
+        )
+        if compressed:
+            task_logger.warning("Design revision prompt auto-compressed (est_tokens_after=%d).", est)
+
         log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"designer_revision_{design_rev+1}", system_d2, user_d2)
         revise_out = llm.chat(model=cfg.designer_model, system=system_d2, user=user_d2)
 
         new_uml = extract_fenced_block(revise_out, "plantuml")
         if new_uml:
-            # Validate UML after every Designer call
-            current_uml, uml_png_ok, uml_err = validate_and_render_uml_with_repair(
-                llm=llm,
-                cfg=cfg,
-                requirement_packet=requirement_packet,
-                prompts_dir=prompts_dir,
-                task_dir=task_dir,
-                task_slug=task_slug,
-                uml_text=new_uml,
-                task_logger=task_logger,
-                run_logger=run_logger,
+            current_uml, uml_ok, uml_err = validate_and_render_uml_with_repair(
+                llm, cfg, requirement_packet, prompts_dir, task_dir, task_slug, new_uml, task_logger, run_logger
             )
-            if uml_png_ok:
+            if uml_ok:
                 log("Rendered UML PNG after design revision")
             else:
                 log("UML PNG not rendered after design revision: %s", uml_err)
@@ -532,17 +665,30 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, prompts_dir: str, o
             write_text(os.path.join(task_dir, f"revise_raw_{design_rev+1}.txt"), revise_out)
             log("Design revision did not return PlantUML; keeping previous UML.")
 
-        # Regenerate code
+        # ---- regenerate code
         log("Regenerating code after design revision")
         system_c2 = "You are a professional Python developer specialising in numerical/scientific computing."
-        user_c2 = coder_tpl.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=current_uml, ARCHITECTURE_TEXT=architecture, CONTRACT_TEXT=contract_txt)
+        user_c2 = coder_tpl.format(
+            REQUIREMENT_PACKET=requirement_packet,
+            UML_TEXT=current_uml,
+            ARCHITECTURE_TEXT=architecture,
+            CONTRACT_TEXT=contract_txt,
+        )
+        system_c2, user_c2, compressed, est = auto_compress_prompts(
+            llm, cfg, system_c2, user_c2,
+            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": current_uml, "CONTRACT_TEXT": contract_txt},
+            task_logger=task_logger,
+        )
+        if compressed:
+            task_logger.warning("Coder-after-design prompt auto-compressed (est_tokens_after=%d).", est)
+
         log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"coder_after_design_{design_rev+1}", system_c2, user_c2)
-        coder_out = llm.chat(model=cfg.coder_model, system=system_c2, user=user_c2)
-        regen = extract_fenced_block(coder_out, "python")
+        coder2_out = llm.chat(model=cfg.coder_model, system=system_c2, user=user_c2)
+        regen = extract_fenced_block(coder2_out, "python")
         if regen:
             current_code = regen
         else:
-            write_text(os.path.join(task_dir, f"coder_raw_after_design_{design_rev+1}.txt"), coder_out)
+            write_text(os.path.join(task_dir, f"coder_raw_after_design_{design_rev+1}.txt"), coder2_out)
 
 
 # ----------------------------
@@ -556,8 +702,12 @@ def main() -> int:
     parser.add_argument("--prompts", default="prompts")
     parser.add_argument("--out", default="out")
     parser.add_argument("--smoke-test", action="store_true")
-    parser.add_argument("--log-prompts", action="store_true", help="Log all prompts (system+user) to task.log and prompts_used/*.txt")
-    parser.add_argument("--log-prompts-include-runlog", action="store_true", help="Also echo prompts into out/run.log")
+
+    parser.add_argument("--log-prompts", action="store_true", help="Save prompts to out/<task>/prompts_used/*.txt")
+    parser.add_argument("--log-prompts-include-runlog", action="store_true", help="Also echo prompt paths to out/run.log")
+
+    parser.add_argument("--prompt-token-budget", type=int, default=None, help="Estimated token budget for (system+user).")
+    parser.add_argument("--compress-target-tokens", type=int, default=None, help="Target token size for compressed blocks.")
 
     args = parser.parse_args()
 
@@ -568,17 +718,20 @@ def main() -> int:
         cfg.log_prompts = True
     if args.log_prompts_include_runlog:
         cfg.log_prompts_include_runlog = True
+    if args.prompt_token_budget is not None:
+        cfg.prompt_token_budget = int(args.prompt_token_budget)
+    if args.compress_target_tokens is not None:
+        cfg.compress_target_tokens = int(args.compress_target_tokens)
 
     os.makedirs(args.out, exist_ok=True)
     run_logger = setup_logger(os.path.join(args.out, "run.log"), also_console=True)
 
-    run_logger.info("Starting StructGen runner")
-    run_logger.info("Config: %s", args.config)
+    run_logger.info("Starting StructGen runner (v1)")
     run_logger.info("Requirements: %s", args.requirements)
     run_logger.info("Prompts dir: %s", args.prompts)
     run_logger.info("Output dir: %s", args.out)
     run_logger.info("Smoke test: %s", cfg.smoke_test)
-    run_logger.info("Log prompts: %s (include run.log: %s)", cfg.log_prompts, cfg.log_prompts_include_runlog)
+    run_logger.info("Prompt length check: %s (budget=%s)", cfg.prompt_length_check, cfg.prompt_token_budget)
 
     tasks = parse_tasks(read_text(args.requirements))
     run_logger.info("Found %d task(s)", len(tasks))
