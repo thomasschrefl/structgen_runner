@@ -1,29 +1,20 @@
 {
-  "ollama_base_url": "http://localhost:11434/v1",
-  "ollama_api_key": "ollama",
-
-  "designer_model": "qwen2.5-coder:7b",
-  "coder_model": "qwen2.5-coder:7b",
-  "summarizer_model": "qwen2.5-coder:1.5b",
-
-  "temperature": 0.05,
-  "top_p": 0.9,
-  "max_tokens": 3072,
-
-  "fail_on_error_output": true,
+  "base_url": "http://promethium:8000/v1",
+  "api_key": "sk-no-key-required",
+  "model": "qwen2.5-coder-32b-instruct",
+  "temperature": 0.2,
+  "top_p": 0.95,
+  "max_tokens": 4096,
   "max_code_repairs": 3,
   "max_design_revisions": 3,
   "max_uml_repairs": 3,
-
   "plantuml_jar_path": "./plantuml.jar",
-
   "smoke_test": false,
-
   "log_prompts": false,
   "log_prompts_include_runlog": false,
-
   "prompt_length_check": true,
-  "prompt_token_budget": 5500,
+  "prompt_token_budget": 24000,
   "prompt_estimator": "chars_div_4",
-  "compress_target_tokens": 2000
+  "compress_target_tokens": 6000,
+  "fail_on_error_output": false
 }

@@ -1,5 +1,4 @@
-**Role: Designer (UML Repair Mode)**
-
+**Role: Designer (UML Repair Mode — ACTIVITY)**
 PlantUML reported syntax errors. Fix **ONLY** UML syntax so that:
 - `java -jar plantuml.jar -checkonly -failonerror <file>` succeeds.
 - Diagram remains an **activity** diagram.

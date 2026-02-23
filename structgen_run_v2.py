@@ -83,12 +83,14 @@ def infer_title(requirement_packet: str) -> str:
             return line.strip()[:80]
     return "Untitled Task"
 
-
 def extract_fenced_block(text: str, lang: str) -> Optional[str]:
     pattern = rf"```{re.escape(lang)}\s*(.*?)```"
     m = re.search(pattern, text, flags=re.DOTALL | re.IGNORECASE)
     return m.group(1).strip() if m else None
 
+def extract_fenced_blocks(text: str, lang: str) -> List[str]:
+    pattern = rf"```{re.escape(lang)}\s*(.*?)```"
+    return [m.group(1).strip() for m in re.finditer(pattern, text, flags=re.DOTALL | re.IGNORECASE)]
 
 def extract_section(text: str, header: str) -> str:
     pattern = rf"{re.escape(header)}\s*\n(.*?)(\n[A-Z][A-Za-z0-9/& \-\(\)]+:\s*\n|\Z)"
@@ -133,12 +135,12 @@ def setup_logger(log_path: str, also_console: bool = True) -> logging.Logger:
 
 @dataclass
 class Config:
-    ollama_base_url: str = "http://localhost:11434/v1"
-    ollama_api_key: str = "ollama"
+    # OpenAI-compatible endpoint (llama.cpp-server /v1)
+    base_url: str = "http://localhost:8080/v1"
+    api_key: str = "sk-no-key-required"
 
-    designer_model: str = "qwen2.5-coder:7b"
-    coder_model: str = "qwen2.5-coder:7b"
-    summarizer_model: str = ""  # optional; if empty uses designer_model
+    # Single model used for designer + coder + summariser
+    model: str = "qwen2.5-coder:14b"
 
     temperature: float = 0.2
     top_p: float = 0.95
@@ -149,25 +151,33 @@ class Config:
     max_uml_repairs: int = 3
 
     plantuml_jar_path: str = "./plantuml.jar"
-
     smoke_test: bool = False
 
-    # prompt logging
     log_prompts: bool = False
     log_prompts_include_runlog: bool = False
 
-    # prompt length guardrail
     prompt_length_check: bool = True
     prompt_token_budget: int = 5500
-    prompt_estimator: str = "chars_div_4"  # chars_div_4 | words_1p3
+    prompt_estimator: str = "chars_div_4"
     compress_target_tokens: int = 2000
 
-    # optional: treat printed "Error:" as failure
     fail_on_error_output: bool = False
 
     @staticmethod
     def load(path: str) -> "Config":
         data = json.loads(read_text(path))
+
+        # Back-compat (old configs)
+        if "ollama_base_url" in data and "base_url" not in data:
+            data["base_url"] = data["ollama_base_url"]
+        if "ollama_api_key" in data and "api_key" not in data:
+            data["api_key"] = data["ollama_api_key"]
+
+        # Prefer any legacy role model if provided
+        for k in ("coder_model", "designer_model", "summarizer_model"):
+            if k in data and data.get(k) and "model" not in data:
+                data["model"] = data[k]
+
         cfg = Config()
         for k, v in data.items():
             if hasattr(cfg, k):
@@ -182,18 +192,20 @@ class Config:
 class LLM:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.client = OpenAI(base_url=cfg.ollama_base_url, api_key=cfg.ollama_api_key)
+        self.client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
 
-    def chat(self, model: str, system: str, user: str) -> str:
+    def chat(self, system: str, user: str, model: Optional[str] = None) -> str:
         resp = self.client.chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            model=(model or self.cfg.model),
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
             temperature=self.cfg.temperature,
             top_p=self.cfg.top_p,
             max_tokens=self.cfg.max_tokens,
         )
         return resp.choices[0].message.content
-
 
 # ----------------------------
 # Prompt logging
@@ -256,8 +268,8 @@ def summarise_text(llm: LLM, cfg: Config, text: str, target_tokens: int, purpose
     if truncated is not text:
         task_logger.warning("Summariser input truncated for %s.", purpose)
 
-    model = cfg.summarizer_model.strip() or cfg.designer_model
-    system_p = "You compress technical instructions without losing constraints."
+    model = cfg.model
+    system_p = "Compress without losing constraints."
     user_p = (
         f"Compress the following content to <= {target_tokens} tokens (roughly).\n"
         "Preserve: function signature, I/O schema, constraints, allowed libraries, determinism rules, and any '@' directives.\n"
@@ -265,7 +277,7 @@ def summarise_text(llm: LLM, cfg: Config, text: str, target_tokens: int, purpose
         f"PURPOSE: {purpose}\n\n"
         f"CONTENT:\n{truncated}"
     )
-    out = llm.chat(model=model, system=system_p, user=user_p)
+    out = llm.chat(system=system_p, user=user_p, model=model)
     return out.strip()
 
 
@@ -353,19 +365,48 @@ def plantuml_render_png(puml_path: str, png_path: str, jar_path: str, logger: lo
         return False, "Java not found on PATH (install Java to enable PlantUML)."
 
 
-def build_repair_uml_prompt(requirement_packet: str, uml_text: str, plantuml_error: str, template: Optional[str]) -> str:
+def build_repair_uml_prompt(
+    diagram_kind: str,
+    requirement_packet: str,
+    uml_text: str,
+    plantuml_error: str,
+    template: Optional[str],
+) -> str:
+    """
+    Build a repair prompt for PlantUML.
+    diagram_kind: "activity" or "class"
+    """
     if template:
-        return template.format(REQUIREMENT_PACKET=requirement_packet, UML_TEXT=uml_text, PLANTUML_ERROR=plantuml_error)
+        return template.format(
+            REQUIREMENT_PACKET=requirement_packet,
+            UML_TEXT=uml_text,
+            PLANTUML_ERROR=plantuml_error,
+        )
+
+    if diagram_kind == "class":
+        return (
+            "Role: Designer (UML Repair / CLASS)\n"
+            "Fix ONLY PlantUML class diagram syntax so -checkonly passes and PNG renders.\n"
+            "Rules: one @startuml..@enduml; use class/interface/enum/package; relationships ok "
+            "(--, <|--, *--, o--, ..>, ..|>).\n"
+            "No Markdown inside UML.\n\n"
+            f"PlantUML error:\n{plantuml_error}\n\n"
+            f"Requirement packet:\n{requirement_packet}\n\n"
+            f"Previous UML:\n```plantuml\n{uml_text}\n```\n\n"
+            "OUTPUT: one fenced ```plantuml``` block only.\n"
+        )
+
+    # default: activity
     return (
-        "Role: Designer (UML Repair Mode)\n\n"
-        "Fix ONLY PlantUML activity-diagram syntax so -checkonly passes and PNG renders.\n"
-        "Rules: one @startuml..@enduml, start/stop, :actions;, if/endif, while/endwhile, no '->', no 'do', no 'end while'.\n\n"
+        "Role: Designer (UML Repair / ACTIVITY)\n"
+        "Fix ONLY PlantUML activity diagram syntax so -checkonly passes and PNG renders.\n"
+        "Rules: one @startuml..@enduml, start/stop, :actions;, if/endif, while/endwhile, repeat/repeat while.\n"
+        "Forbidden: '->', participant/actor, 'do', 'end while', Markdown inside UML.\n\n"
         f"PlantUML error:\n{plantuml_error}\n\n"
         f"Requirement packet:\n{requirement_packet}\n\n"
         f"Previous UML:\n```plantuml\n{uml_text}\n```\n\n"
         "OUTPUT: one fenced ```plantuml``` block only.\n"
     )
-
 
 def validate_and_render_uml_with_repair(
     llm: LLM,
@@ -377,8 +418,11 @@ def validate_and_render_uml_with_repair(
     uml_text: str,
     task_logger: logging.Logger,
     run_logger: logging.Logger,
+    *,
+    repair_prompt_file: str = "repair_uml.md",
+    diagram_kind: str = "activity",
 ) -> Tuple[str, bool, str]:
-    repair_uml_tpl = load_prompt_optional(prompts_dir, "repair_uml.md")
+    repair_uml_tpl = load_prompt_optional(prompts_dir, repair_prompt_file)
     puml_path = os.path.join(task_dir, f"{task_slug}.puml")
     png_path = os.path.join(task_dir, f"{task_slug}.png")
 
@@ -395,15 +439,15 @@ def validate_and_render_uml_with_repair(
             if attempt >= cfg.max_uml_repairs:
                 return current_uml, False, last_err
 
-            system_p = "You repair PlantUML activity diagrams to be syntactically valid."
-            user_p = build_repair_uml_prompt(requirement_packet, current_uml, err, repair_uml_tpl)
+            system_p = f"You repair PlantUML {diagram_kind} diagrams to be syntactically valid."
+            user_p = build_repair_uml_prompt(diagram_kind, requirement_packet, current_uml, err, repair_uml_tpl)
             system_p, user_p, _, _ = auto_compress_prompts(
                 llm, cfg, system_p, user_p,
-                components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": current_uml},
+                components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both},
                 task_logger=task_logger,
             )
             log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_repair_uml", system_p, user_p)
-            repair_out = llm.chat(model=cfg.designer_model, system=system_p, user=user_p)
+            repair_out = llm.chat(system=system_p, user=user_p, model=cfg.model)
             repaired = extract_fenced_block(repair_out, "plantuml")
             if repaired:
                 current_uml = repaired
@@ -420,15 +464,15 @@ def validate_and_render_uml_with_repair(
         if attempt >= cfg.max_uml_repairs:
             return current_uml, False, last_err
 
-        system_p = "You repair PlantUML activity diagrams to be syntactically valid."
-        user_p = build_repair_uml_prompt(requirement_packet, current_uml, err, repair_uml_tpl)
+        system_p = f"You repair PlantUML {diagram_kind} diagrams to be syntactically valid."
+        user_p = build_repair_uml_prompt(diagram_kind, requirement_packet, current_uml, err, repair_uml_tpl)
         system_p, user_p, _, _ = auto_compress_prompts(
             llm, cfg, system_p, user_p,
-            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": current_uml},
+            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both},
             task_logger=task_logger,
         )
         log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_repair_uml_after_render", system_p, user_p)
-        repair_out = llm.chat(model=cfg.designer_model, system=system_p, user=user_p)
+        repair_out = llm.chat(system=system_p, user=user_p, model=cfg.model)
         repaired = extract_fenced_block(repair_out, "plantuml")
         if repaired:
             current_uml = repaired
@@ -795,7 +839,7 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
     revise_design_tpl = load_prompt(prompts_dir, "revise_design.md")
 
     # ---- Designer initial
-    log("Calling Designer model: %s", cfg.designer_model)
+    log("Calling model: %s", cfg.model)
     system_p = "You are a careful software designer for scientific Python."
     user_p = designer_tpl.format(REQUIREMENT_PACKET=requirement_packet)
     system_p, user_p, compressed, est = auto_compress_prompts(
@@ -806,45 +850,69 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
     if compressed:
         task_logger.warning("Designer prompt auto-compressed (est_tokens_after=%d).", est)
     log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_initial", system_p, user_p)
-    designer_out = llm.chat(model=cfg.designer_model, system=system_p, user=user_p)
+    designer_out = llm.chat(system=system_p, user=user_p, model=cfg.model)
 
-    uml = extract_fenced_block(designer_out, "plantuml")
-    if not uml:
+    puml_blocks = extract_fenced_blocks(designer_out, "plantuml")
+    if len(puml_blocks) < 2:
         write_text(os.path.join(task_dir, "designer_raw.txt"), designer_out)
-        raise RuntimeError("Designer did not produce a PlantUML fenced block. See designer_raw.txt")
+        raise RuntimeError("Designer must produce TWO ```plantuml``` blocks (activity + class).")
+
+    uml_activity = puml_blocks[0]
+    uml_class = puml_blocks[1]
 
     architecture = extract_section(designer_out, "Architecture:")
-    contract_txt = extract_section(designer_out, "I/O & Verification Contract:")
+    contract_txt = extract_section(designer_out, "IO and Verification Contract:")
 
-    uml, uml_ok, uml_err = validate_and_render_uml_with_repair(
-        llm, cfg, requirement_packet, prompts_dir, task_dir, task_slug, uml, task_logger, run_logger
+    # Render ACTIVITY diagram
+    uml_activity, act_ok, act_err = validate_and_render_uml_with_repair(
+        llm, cfg, requirement_packet, prompts_dir, task_dir,
+        f"{task_slug}_activity",
+        uml_activity, task_logger, run_logger,
+        repair_prompt_file="repair_uml.md",
+        diagram_kind="activity",
     )
-    if uml_ok:
-        log("Rendered UML PNG")
+    if act_ok:
+        log("Rendered ACTIVITY PNG")
     else:
-        log("UML PNG not rendered: %s", uml_err)
+        log("ACTIVITY PNG not rendered: %s", act_err)
+
+    # Render CLASS diagram
+    uml_class, cls_ok, cls_err = validate_and_render_uml_with_repair(
+        llm, cfg, requirement_packet, prompts_dir, task_dir,
+        f"{task_slug}_class",  # keeps filenames separate
+        uml_class, task_logger, run_logger,
+        repair_prompt_file="repair_class_uml.md",
+        diagram_kind="class",
+    )
+    if cls_ok:
+        log("Rendered CLASS PNG")
+    else:
+        log("CLASS PNG not rendered: %s", cls_err)
+
+    # Concatenate diagrams for the coder (activity + class)
+    uml_both = uml_activity + "\n\n" + uml_class
 
     write_text(os.path.join(task_dir, "architecture.txt"), architecture + "\n")
     write_text(os.path.join(task_dir, "contract.txt"), contract_txt + "\n")
 
     # ---- Coder initial
-    log("Calling Coder model: %s", cfg.coder_model)
+    log("Calling model: %s", cfg.model)
     system_c = "You are a professional Python developer specialising in numerical/scientific computing."
     user_c = coder_tpl.format(
         REQUIREMENT_PACKET=requirement_packet,
-        UML_TEXT=uml,
+        UML_TEXT=uml_both,
         ARCHITECTURE_TEXT=architecture,
         CONTRACT_TEXT=contract_txt,
     )
     system_c, user_c, compressed, est = auto_compress_prompts(
         llm, cfg, system_c, user_c,
-        components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml, "CONTRACT_TEXT": contract_txt},
+        components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both, "CONTRACT_TEXT": contract_txt},
         task_logger=task_logger,
     )
     if compressed:
         task_logger.warning("Coder prompt auto-compressed (est_tokens_after=%d).", est)
     log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "coder_initial", system_c, user_c)
-    coder_out = llm.chat(model=cfg.coder_model, system=system_c, user=user_c)
+    coder_out = llm.chat(system=system_c, user=user_c, model=cfg.model)
 
     code = extract_fenced_block(coder_out, "python")
     if not code:
@@ -852,7 +920,7 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
         raise RuntimeError("Coder did not produce a Python fenced block. See coder_raw.txt")
 
     current_code = code
-    current_uml = uml
+    current_uml = uml_activity
 
     for design_rev in range(cfg.max_design_revisions + 1):
         for repair in range(cfg.max_code_repairs + 1):
@@ -875,19 +943,19 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
             system_r = "You repair scientific Python code based on verification feedback."
             user_r = repair_code_tpl.format(
                 REQUIREMENT_PACKET=requirement_packet,
-                UML_TEXT=current_uml,
+                UML_TEXT=uml_both,
                 PREV_CODE=current_code,
                 FAILURE_REPORT=report,
             )
             system_r, user_r, compressed, est = auto_compress_prompts(
                 llm, cfg, system_r, user_r,
-                components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": current_uml},
+                components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both},
                 task_logger=task_logger,
             )
             if compressed:
                 task_logger.warning("Repair prompt auto-compressed (est_tokens_after=%d).", est)
             log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"coder_repair_{repair+1}", system_r, user_r)
-            repair_out = llm.chat(model=cfg.coder_model, system=system_r, user=user_r)
+            repair_out = llm.chat(system=system_r, user=user_r, model=cfg.model)
             repaired = extract_fenced_block(repair_out, "python")
             if repaired:
                 current_code = repaired
@@ -905,18 +973,18 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
         system_d2 = "You revise UML designs for scientific Python workflows."
         user_d2 = revise_design_tpl.format(
             REQUIREMENT_PACKET=requirement_packet,
-            UML_TEXT=current_uml,
+            UML_TEXT=uml_both,
             FAILURE_REPORT=read_text(os.path.join(task_dir, "last_verification.txt")),
         )
         system_d2, user_d2, compressed, est = auto_compress_prompts(
             llm, cfg, system_d2, user_d2,
-            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": current_uml},
+            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both},
             task_logger=task_logger,
         )
         if compressed:
             task_logger.warning("Design revision prompt auto-compressed (est_tokens_after=%d).", est)
         log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"designer_revision_{design_rev+1}", system_d2, user_d2)
-        revise_out = llm.chat(model=cfg.designer_model, system=system_d2, user=user_d2)
+        revise_out = llm.chat(system=system_d2, user=user_d2, model=cfg.model)
 
         new_uml = extract_fenced_block(revise_out, "plantuml")
         if new_uml:
@@ -933,22 +1001,23 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
 
         # regenerate code
         log("Regenerating code after design revision")
+        uml_both = current_uml + "\n\n" + uml_class
         system_c2 = "You are a professional Python developer specialising in numerical/scientific computing."
         user_c2 = coder_tpl.format(
             REQUIREMENT_PACKET=requirement_packet,
-            UML_TEXT=current_uml,
+            UML_TEXT=uml_both,
             ARCHITECTURE_TEXT=architecture,
             CONTRACT_TEXT=contract_txt,
         )
         system_c2, user_c2, compressed, est = auto_compress_prompts(
             llm, cfg, system_c2, user_c2,
-            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": current_uml, "CONTRACT_TEXT": contract_txt},
+            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both, "CONTRACT_TEXT": contract_txt},
             task_logger=task_logger,
         )
         if compressed:
             task_logger.warning("Coder-after-design prompt auto-compressed (est_tokens_after=%d).", est)
         log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"coder_after_design_{design_rev+1}", system_c2, user_c2)
-        coder2_out = llm.chat(model=cfg.coder_model, system=system_c2, user=user_c2)
+        coder2_out = llm.chat(system=system_c2, user=user_c2, model=cfg.model)
         regen = extract_fenced_block(coder2_out, "python")
         if regen:
             current_code = regen
