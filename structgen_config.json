@@ -6,10 +6,11 @@
   "coder_model": "qwen2.5-coder:7b",
   "summarizer_model": "qwen2.5-coder:1.5b",
 
-  "temperature": 0.15,
+  "temperature": 0.05,
   "top_p": 0.9,
   "max_tokens": 3072,
 
+  "fail_on_error_output": true,
   "max_code_repairs": 3,
   "max_design_revisions": 3,
   "max_uml_repairs": 3,

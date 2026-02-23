@@ -2,23 +2,35 @@
 
 Fix the code to satisfy the requirement and pass verification.
 
-Rules:
+Hard rules:
 - Output ONLY one ```python``` block.
-- Keep ONE public entry point: `run(...)`.
-- Do NOT change the UML; follow it.
+- Keep ONE public entry point: `run(input_path, output_path, ...)`.
+- Follow the UML control flow; do not change UML.
+- Do NOT swallow fatal errors: if execution cannot proceed, RAISE an exception (do not only print).
+- Make the smallest change that fixes the failure.
+- Use only allowed libraries; do not invent APIs.
+
+Repair method:
+1) Identify the root cause from FAILURE_REPORT (not just the symptom).
+2) Fix it, then ensure output is written with the required schema.
+3) Add/adjust validation so the same failure cannot recur silently.
+4) Keep deterministic behaviour and respect all constraints.
 
 Requirement:
 ```text
 {REQUIREMENT_PACKET}
 ```
+
 UML:
 ```plantuml
 {UML_TEXT}
 ```
+
 Previous code:
 ```python
 {PREV_CODE}
 ```
+
 Failure report:
 ```text
 {FAILURE_REPORT}

@@ -1,44 +1,38 @@
-TITLE: Denoise sensor signal (rolling median + moving average) (CSV -> CSV)
+TITLE: Resample irregular time series to regular grid (CSV -> CSV)
 GOAL:
-  Read CSV input_path with columns: timestamp (ISO-8601 string), value (float).
-  Perform denoising in two steps:
-    1) Rolling median filter with window_size samples.
-    2) Moving average filter (centered) with window_size samples applied to the median-filtered signal.
-  Write CSV output_path with columns: timestamp, value_raw, value_median, value_denoised.
-  Return a summary dict with keys: n, window_size, rms_raw, rms_denoised.
+  Read CSV input_path with columns: t (float seconds), v (float).
+  The time stamps are irregular and increasing.
+  Create a regular time grid from min(t) to max(t) with step dt.
+  Interpolate v onto this grid using linear interpolation.
+  Write CSV output_path with columns: t, v_interp.
+  Return a summary dict with keys: n_in, n_out, dt.
 
 ENTRY POINT (Python):
-  def run(input_path: str, output_path: str, window_size: int = 5, *, seed: int | None = None) -> dict | None
+  def run(input_path: str, output_path: str, dt: float = 0.5, *, seed: int | None = None) -> dict | None
 
 INPUTS:
   - input_path:
-      format: CSV (UTF-8, comma-separated)
-      schema:
-        - timestamp: str (ISO-8601, increasing)
-        - value: float
-      constraints:
-        - at least window_size rows
-        - values finite
-  - window_size: int >= 3 and odd (if even, increase by 1)
+      format: CSV
+      schema: t: float, v: float
+      constraints: t strictly increasing, dt > 0
 
 OUTPUTS:
   - output_path:
       format: CSV
-      schema:
-        - timestamp: str
-        - value_raw: float
-        - value_median: float
-        - value_denoised: float
+      schema: t: float, v_interp: float
 
 NUMERICAL REQUIREMENTS:
   - Deterministic: yes.
-  - No NaNs/Infs in outputs.
-
-OPTIONAL PARTIAL CONSTRAINTS / PROPERTIES:
-  - rms_denoised <= rms_raw (within rel_tol=1e-12)
+  - No NaNs in v_interp.
 
 ALLOWED LIBRARIES:
   numpy, pandas
 
-INPUT FILES PROVIDED WITH THIS EXAMPLE:
-  - input_01_sensor.csv
+# Verification contract (StructGen v2)
+@input_file: input_03_irregular.csv
+@output_file: output_03.csv
+@params: dt=0.5
+@output_schema: t,v_interp
+@check: columns(t,v_interp)
+@check: finite(v_interp)
+@check: count() > 0

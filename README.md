@@ -96,6 +96,9 @@ Create `structgen_config.json` like:
 
 Ensure Ollama is running and your chosen model is available.
 
+nohup env OLLAMA_CONTEXT_LENGTH=8192 ollama serve > ollama_serve.log 2>&1 &
+disown
+
 ---
 
 ## Prompt templates (editable)

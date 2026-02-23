@@ -1,33 +1,15 @@
 #!/usr/bin/env python3
-"""StructGen runner v2 (verification DSL) — FULL VERSION.
+"""StructGen runner v2 (verification DSL) — with stdout/stderr capture AND full tracebacks.
 
-Features
-1) UML robustness
-   - PlantUML syntax check (-checkonly -failonerror) before rendering.
-   - UML auto-repair via Designer if syntax check fails.
-   - Runs after EVERY Designer call (initial + design revisions).
+Adds to previous build:
+- When an exception occurs during run(), the verification report includes the full traceback (line numbers).
+- When module exec fails, the verification report includes the full traceback.
 
-2) Prompt length guardrail (auto-compress + continue)
-   - Estimates prompt size (heuristic tokens).
-   - If above budget, compresses large components (requirements/UML/contract) using a summariser call.
-   - Continues but emits WARNINGs.
-
-3) Optional prompt logging
-   - Save prompts to out/<task>/prompts_used/*.txt (and record file paths in logs).
-
-4) Verification DSL
-   - Parse @directives from requirement packet:
-       @input_file: <file>
-       @output_file: <file>
-       @params: k=v,...
-       @output_schema: c1,c2,...
-       @check: ...
-   - Runs generated run() in a temporary sandbox and applies checks.
-
-IMPORTANT FIX (this build):
-- Captures stdout/stderr from run() during verification.
-- On failure (exception OR output missing OR check failure), the verification report includes captured output.
-  This ensures the repair loop sees the real root cause even if run() prints errors and returns.
+Other features retained:
+- PlantUML syntax-check + UML auto-repair after every Designer call.
+- Prompt length guardrail (auto-compress + continue) with warnings.
+- Optional prompt logging.
+- Verification DSL (@input_file, @params, @check, ...).
 
 WARNING: Logging prompts may expose sensitive content. Use only in trusted environments.
 """
@@ -46,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -179,6 +162,9 @@ class Config:
     prompt_estimator: str = "chars_div_4"  # chars_div_4 | words_1p3
     compress_target_tokens: int = 2000
 
+    # optional: treat printed "Error:" as failure
+    fail_on_error_output: bool = False
+
     @staticmethod
     def load(path: str) -> "Config":
         data = json.loads(read_text(path))
@@ -265,7 +251,6 @@ def needs_compress(cfg: Config, system_prompt: str, user_prompt: str) -> Tuple[b
 
 
 def summarise_text(llm: LLM, cfg: Config, text: str, target_tokens: int, purpose: str, task_logger: logging.Logger) -> str:
-    # Truncate huge inputs before summarising
     max_chars = target_tokens * 8
     truncated = text if len(text) <= max_chars * 8 else text[: max_chars * 8]
     if truncated is not text:
@@ -668,7 +653,7 @@ def _run_checks(checks: List[str], output_path: str, contract: Contract) -> Tupl
 
 
 # ----------------------------
-# Verification (FIXED: captures stdout/stderr)
+# Verification (captures stdout/stderr + full tracebacks)
 # ----------------------------
 
 def _format_captured_io(stdout_txt: str, stderr_txt: str) -> str:
@@ -680,18 +665,28 @@ def _format_captured_io(stdout_txt: str, stderr_txt: str) -> str:
     return "\n\n".join(parts)
 
 
-def verify_generated_code(code: str, requirement_packet: str, requirements_path: str, smoke_test: bool) -> Tuple[bool, str]:
-    # compile + exec
+def _format_traceback(exc: BaseException) -> str:
+    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    return "".join(tb_lines).rstrip()
+
+
+def verify_generated_code(code: str, requirement_packet: str, requirements_path: str, smoke_test: bool, cfg: Optional[Config] = None) -> Tuple[bool, str]:
+    """Returns (ok, report). If cfg is provided, applies cfg.fail_on_error_output."""
+
+    # compile
     try:
         compiled = compile(code, "<generated>", "exec")
     except Exception as e:
-        return False, f"Compilation error: {e}"
+        tb = _format_traceback(e)
+        return False, f"Compilation error: {e}\n\n[traceback]\n{tb}"
 
+    # exec (import-time)
     ns: Dict[str, Any] = {}
     try:
         exec(compiled, ns, ns)
     except Exception as e:
-        return False, f"Runtime error during module exec: {e}"
+        tb = _format_traceback(e)
+        return False, f"Runtime error during module exec: {e}\n\n[traceback]\n{tb}"
 
     run_fn = ns.get("run")
     if not callable(run_fn):
@@ -699,13 +694,11 @@ def verify_generated_code(code: str, requirement_packet: str, requirements_path:
 
     contract = parse_contract(requirement_packet)
 
-    # No contract and no smoke_test: minimal verification
     if (not contract.checks) and (not contract.input_file) and (not smoke_test):
         return True, "Basic verification passed (compile + load + run present)."
 
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            # input
             if contract.input_file:
                 req_dir = os.path.dirname(os.path.abspath(requirements_path))
                 src = os.path.join(req_dir, contract.input_file)
@@ -718,11 +711,9 @@ def verify_generated_code(code: str, requirement_packet: str, requirements_path:
                 with open(input_path, "wb") as f:
                     f.write(b"")
 
-            # output
             out_name = contract.output_file or "output.csv"
             output_path = os.path.join(tmp, out_name)
 
-            # capture stdout/stderr from run
             buf_out = io.StringIO()
             buf_err = io.StringIO()
 
@@ -733,44 +724,37 @@ def verify_generated_code(code: str, requirement_packet: str, requirements_path:
                 except BaseException as e:
                     run_exc = e
 
-            captured = _format_captured_io(buf_out.getvalue(), buf_err.getvalue())
             stdout_txt = buf_out.getvalue()
             stderr_txt = buf_err.getvalue()
+            captured = _format_captured_io(stdout_txt, stderr_txt)
 
-            error_markers = [
-                "Error:",
-                "Traceback (most recent call last):",
-                "Exception:",
-            ]
+            # Optional: fail on printed error markers
+            if cfg is not None and cfg.fail_on_error_output:
+                if ("Error:" in stdout_txt) or ("Error:" in stderr_txt):
+                    msg = "Captured error output detected (contains 'Error:'). Treating as verification FAIL."
+                    if captured:
+                        msg += "\n\n" + captured
+                    return False, msg
 
-            if any(m in stdout_txt for m in error_markers) or any(m in stderr_txt for m in error_markers):
-                msg = "Captured error-like output detected. Treating as verification FAIL."
-                if captured:
-                    msg += "\n\n" + captured
-                return False, msg 
-
-            # If run raised, fail and include captured output
             if run_exc is not None:
-                msg = f"Run execution raised an exception: {run_exc}"
+                tb = _format_traceback(run_exc)
+                msg = f"Run execution raised an exception: {run_exc}\n\n[traceback]\n{tb}"
                 if captured:
                     msg += "\n\n" + captured
                 return False, msg
 
-            # If output missing, fail and include captured output
             if not os.path.exists(output_path):
                 msg = f"Output file not created: {output_path}"
                 if captured:
                     msg += "\n\n" + captured
                 return False, msg
 
-            # If contract checks exist, run them; include captured output if they fail
             if contract.checks or contract.output_schema:
                 ok, report = _run_checks(contract.checks or [], output_path, contract)
                 if (not ok) and captured:
                     report += "\n\n" + captured
                 return ok, report
 
-            # Smoke-test expectation: output exists already checked
             if smoke_test:
                 msg = "Smoke-test passed (run executed and created output file)."
                 if captured:
@@ -783,11 +767,12 @@ def verify_generated_code(code: str, requirement_packet: str, requirements_path:
             return True, msg
 
     except Exception as e:
-        return False, f"Verification harness error: {e}"
+        tb = _format_traceback(e)
+        return False, f"Verification harness error: {e}\n\n[traceback]\n{tb}"
 
 
 # ----------------------------
-# Task runner (Designer/Coder loops)
+# Task runner
 # ----------------------------
 
 def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: str, prompts_dir: str, out_dir: str, run_logger: logging.Logger) -> None:
@@ -831,7 +816,6 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
     architecture = extract_section(designer_out, "Architecture:")
     contract_txt = extract_section(designer_out, "I/O & Verification Contract:")
 
-    # Validate UML after designer call
     uml, uml_ok, uml_err = validate_and_render_uml_with_repair(
         llm, cfg, requirement_packet, prompts_dir, task_dir, task_slug, uml, task_logger, run_logger
     )
@@ -870,10 +854,9 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
     current_code = code
     current_uml = uml
 
-    # ---- Iterate: repair code, revise design
     for design_rev in range(cfg.max_design_revisions + 1):
         for repair in range(cfg.max_code_repairs + 1):
-            ok, report = verify_generated_code(current_code, requirement_packet, requirements_path, cfg.smoke_test)
+            ok, report = verify_generated_code(current_code, requirement_packet, requirements_path, cfg.smoke_test, cfg)
             write_text(os.path.join(task_dir, "last_verification.txt"), report + "\n")
             log("Verification: %s", "PASS" if ok else "FAIL")
             log("Verification report: %s", report.splitlines()[0] if report else "")
@@ -917,7 +900,7 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
             write_text(py_path, current_code + "\n")
             return
 
-        # ---- revise design
+        # ---- design revision
         log("Revising design (attempt %d/%d)", design_rev + 1, cfg.max_design_revisions)
         system_d2 = "You revise UML designs for scientific Python workflows."
         user_d2 = revise_design_tpl.format(
@@ -948,7 +931,7 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
             write_text(os.path.join(task_dir, f"revise_raw_{design_rev+1}.txt"), revise_out)
             log("Design revision did not return PlantUML; keeping previous UML.")
 
-        # regenerate code after design revision
+        # regenerate code
         log("Regenerating code after design revision")
         system_c2 = "You are a professional Python developer specialising in numerical/scientific computing."
         user_c2 = coder_tpl.format(
