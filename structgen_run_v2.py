@@ -97,6 +97,17 @@ def extract_section(text: str, header: str) -> str:
     m = re.search(pattern, text, flags=re.DOTALL)
     return m.group(1).strip() if m else ""
 
+def has_toplevel_run(code: str) -> bool:
+    """Return True if code defines a top-level function named 'run'."""
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        # If it doesn't parse, let the normal verification/repair path handle it
+        return False
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "run":
+            return True
+    return False
 
 def load_prompt(prompts_dir: str, filename: str) -> str:
     path = os.path.join(prompts_dir, filename)
@@ -815,6 +826,158 @@ def verify_generated_code(code: str, requirement_packet: str, requirements_path:
         return False, f"Verification harness error: {e}\n\n[traceback]\n{tb}"
 
 
+def repair_missing_run(
+    llm: LLM,
+    cfg: Config,
+    repair_code_tpl: str,
+    requirement_packet: str,
+    uml_text: str,
+    prev_code: str,
+    task_dir: str,
+    task_logger: logging.Logger,
+    run_logger: logging.Logger,
+    tag: str,
+) -> str:
+    system_r = "You repair scientific Python code based on verification feedback."
+    failure_report = "Missing required entry point: run(...)\nAdd a top-level def run(input_path, output_path, **params): ..."
+
+    user_r = repair_code_tpl.format(
+        REQUIREMENT_PACKET=requirement_packet,
+        UML_TEXT=uml_text,
+        PREV_CODE=prev_code,
+        FAILURE_REPORT=failure_report,
+    )
+
+    system_r, user_r, _, _ = auto_compress_prompts(
+        llm, cfg, system_r, user_r,
+        components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_text},
+        task_logger=task_logger,
+    )
+    log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, tag, system_r, user_r)
+
+    out = llm.chat(system=system_r, user=user_r, model=cfg.model)
+    repaired = extract_fenced_block(out, "python")
+    if repaired:
+        return repaired
+    # Fallback: keep raw response for debugging
+    write_text(os.path.join(task_dir, f"{tag}_raw.txt"), out)
+    return prev_code
+
+
+def materialize_test_run_artifacts(
+    code: str,
+    requirement_packet: str,
+    requirements_path: str,
+    task_dir: str,
+    task_slug: str,
+    logger: logging.Logger,
+) -> None:
+    """
+    Re-run the generated run() in a persistent folder so we keep the produced output,
+    and write a small runner script to reproduce it later.
+    """
+    contract = parse_contract(requirement_packet)
+
+    arte_dir = os.path.join(task_dir, "test_run")
+    os.makedirs(arte_dir, exist_ok=True)
+
+    # Resolve input file
+    if contract.input_file:
+        req_dir = os.path.dirname(os.path.abspath(requirements_path))
+        src_input = os.path.join(req_dir, contract.input_file)
+        if not os.path.exists(src_input):
+            raise FileNotFoundError(f"Contract input file not found: {src_input}")
+        in_name = os.path.basename(contract.input_file)
+        input_path = os.path.join(arte_dir, f"input_{in_name}")
+        shutil.copyfile(src_input, input_path)
+    else:
+        # Placeholder input (some tasks don't need it)
+        input_path = os.path.join(arte_dir, "input_placeholder")
+        with open(input_path, "wb") as f:
+            f.write(b"")
+
+    out_name = contract.output_file or "output.csv"
+    output_path = os.path.join(arte_dir, f"output_{os.path.basename(out_name)}")
+
+    # Execute code in-process and call run()
+    compiled = compile(code, "<generated>", "exec")
+    ns: Dict[str, Any] = {}
+    exec(compiled, ns, ns)
+
+    run_fn = ns.get("run")
+    if not callable(run_fn):
+        raise RuntimeError("Missing required entry point: run(...)")
+
+    buf_out = io.StringIO()
+    buf_err = io.StringIO()
+    run_exc: Optional[BaseException] = None
+
+    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+        try:
+            run_fn(input_path, output_path, **(contract.params or {}))
+        except BaseException as e:
+            run_exc = e
+
+    # Persist captured IO (useful even on success)
+    stdout_txt = buf_out.getvalue()
+    stderr_txt = buf_err.getvalue()
+    captured = _format_captured_io(stdout_txt, stderr_txt)
+    write_text(os.path.join(arte_dir, "captured_io.txt"), (captured + "\n") if captured else "")
+
+    # Persist params
+    write_text(os.path.join(arte_dir, "params.json"), json.dumps(contract.params or {}, indent=2) + "\n")
+
+    if run_exc is not None:
+        tb = _format_traceback(run_exc)
+        raise RuntimeError(f"Re-run to materialize artefacts failed: {run_exc}\n\n{tb}")
+
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"Re-run did not create output file: {output_path}")
+
+    # Write a small runner script to reproduce this later
+    runner_py = os.path.join(arte_dir, "run_test_output.py")
+    module_py = os.path.join(task_dir, f"{task_slug}.py")
+
+    runner_code = f'''#!/usr/bin/env python3
+import json
+import os
+import importlib.util
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TASK_DIR = os.path.abspath(os.path.join(HERE, ".."))
+MODULE_PATH = os.path.join(TASK_DIR, "{task_slug}.py")
+
+def load_module(path):
+    spec = importlib.util.spec_from_file_location("generated_task", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+def main():
+    params_path = os.path.join(HERE, "params.json")
+    params = json.load(open(params_path, "r", encoding="utf-8"))
+
+    input_path = os.path.join(HERE, os.path.basename("{os.path.basename(input_path)}"))
+    output_path = os.path.join(HERE, os.path.basename("{os.path.basename(output_path)}"))
+
+    mod = load_module(MODULE_PATH)
+    mod.run(input_path, output_path, **params)
+    print("Wrote:", output_path)
+
+if __name__ == "__main__":
+    main()
+'''
+    write_text(runner_py, runner_code)
+    try:
+        os.chmod(runner_py, 0o755)
+    except Exception:
+        pass
+
+    logger.info("Materialized test output: %s", output_path)
+    logger.info("Repro script: %s", runner_py)
+
+
+
 # ----------------------------
 # Task runner
 # ----------------------------
@@ -920,8 +1083,16 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
         raise RuntimeError("Coder did not produce a Python fenced block. See coder_raw.txt")
 
     current_code = code
-    current_uml = uml_activity
-
+    # Fast guard: ensure entry point exists before running verification
+    if not has_toplevel_run(current_code):
+        log("Entry point run(...) missing; auto-repairing immediately.")
+        current_code = repair_missing_run(
+            llm, cfg, repair_code_tpl,
+            requirement_packet, uml_both, current_code,
+            task_dir, task_logger, run_logger,
+            tag="coder_repair_missing_run_initial",
+        )    
+        
     for design_rev in range(cfg.max_design_revisions + 1):
         for repair in range(cfg.max_code_repairs + 1):
             ok, report = verify_generated_code(current_code, requirement_packet, requirements_path, cfg.smoke_test, cfg)
@@ -934,6 +1105,23 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
                 write_text(py_path, current_code + "\n")
                 log("Wrote generated code: %s", py_path)
                 log("=== Task succeeded ===")
+                
+                # Create persistent test output + repro script
+                try:
+                    materialize_test_run_artifacts(
+                        current_code,
+                        requirement_packet,
+                        requirements_path,
+                        task_dir,
+                        task_slug,
+                        task_logger,
+                    )
+                except Exception as e:
+                    # Don't fail the whole task if artefact materialization fails,
+                    # but log it loudly.
+                    task_logger.exception("Failed to materialize test-run artefacts: %s", e)
+                    run_logger.exception("[%s] Failed to materialize test-run artefacts: %s", task_slug, e)                
+                
                 return
 
             if repair >= cfg.max_code_repairs:
@@ -959,6 +1147,14 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
             repaired = extract_fenced_block(repair_out, "python")
             if repaired:
                 current_code = repaired
+                if not has_toplevel_run(current_code):
+                    log("Repair output still missing run(...); forcing another repair pass.")
+                    current_code = repair_missing_run(
+                        llm, cfg, repair_code_tpl,
+                        requirement_packet, uml_both, current_code,
+                        task_dir, task_logger, run_logger,
+                        tag=f"coder_repair_missing_run_{repair+1}",
+                    )                                
             else:
                 write_text(os.path.join(task_dir, f"repair_raw_{repair+1}.txt"), repair_out)
 
@@ -986,22 +1182,58 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
         log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"designer_revision_{design_rev+1}", system_d2, user_d2)
         revise_out = llm.chat(system=system_d2, user=user_d2, model=cfg.model)
 
-        new_uml = extract_fenced_block(revise_out, "plantuml")
-        if new_uml:
-            current_uml, uml_ok, uml_err = validate_and_render_uml_with_repair(
-                llm, cfg, requirement_packet, prompts_dir, task_dir, task_slug, new_uml, task_logger, run_logger
-            )
-            if uml_ok:
-                log("Rendered UML PNG after design revision")
-            else:
-                log("UML PNG not rendered after design revision: %s", uml_err)
+        puml_rev = extract_fenced_blocks(revise_out, "plantuml")
+        if len(puml_rev) >= 2:
+            new_activity = puml_rev[0]
+            new_class = puml_rev[1]
         else:
+            # Save raw for debugging and keep previous design
             write_text(os.path.join(task_dir, f"revise_raw_{design_rev+1}.txt"), revise_out)
-            log("Design revision did not return PlantUML; keeping previous UML.")
+            log("Design revision did not return TWO PlantUML blocks; keeping previous UML.")
+            new_activity = None
+            new_class = None
+
+        # Render revised ACTIVITY diagram
+        uml_activity, act_ok, act_err = validate_and_render_uml_with_repair(
+            llm, cfg, requirement_packet, prompts_dir, task_dir,
+            f"{task_slug}_activity",
+            new_activity, task_logger, run_logger,
+            repair_prompt_file="repair_uml.md",
+            diagram_kind="activity",
+        )
+        if act_ok:
+            log("Rendered ACTIVITY PNG after design revision")
+        else:
+            log("ACTIVITY PNG not rendered after design revision: %s", act_err)
+
+        # Render revised CLASS diagram
+        uml_class, cls_ok, cls_err = validate_and_render_uml_with_repair(
+            llm, cfg, requirement_packet, prompts_dir, task_dir,
+            f"{task_slug}_class",
+            new_class, task_logger, run_logger,
+            repair_prompt_file="repair_class_uml.md",
+            diagram_kind="class",
+        )
+        if cls_ok:
+            log("Rendered CLASS PNG after design revision")
+        else:
+            log("CLASS PNG not rendered after design revision: %s", cls_err)
+
+        uml_both = uml_activity + "\n\n" + uml_class
+        
+        new_arch = extract_section(revise_out, "Architecture:")
+        new_contract = extract_section(revise_out, "IO and Verification Contract:")
+
+        if new_arch:
+            architecture = new_arch
+            write_text(os.path.join(task_dir, "architecture.txt"), architecture + "\n")
+
+        if new_contract:
+            contract_txt = new_contract
+            write_text(os.path.join(task_dir, "contract.txt"), contract_txt + "\n")        
 
         # regenerate code
         log("Regenerating code after design revision")
-        uml_both = current_uml + "\n\n" + uml_class
         system_c2 = "You are a professional Python developer specialising in numerical/scientific computing."
         user_c2 = coder_tpl.format(
             REQUIREMENT_PACKET=requirement_packet,
@@ -1021,6 +1253,16 @@ def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: 
         regen = extract_fenced_block(coder2_out, "python")
         if regen:
             current_code = regen
+            if regen:
+                current_code = regen
+                if not has_toplevel_run(current_code):
+                    log("Regenerated code missing run(...); auto-repairing immediately.")
+                    current_code = repair_missing_run(
+                        llm, cfg, repair_code_tpl,
+                        requirement_packet, uml_both, current_code,
+                        task_dir, task_logger, run_logger,
+                        tag=f"coder_repair_missing_run_after_design_{design_rev+1}",
+                    )                        
         else:
             write_text(os.path.join(task_dir, f"coder_raw_after_design_{design_rev+1}.txt"), coder2_out)
 
