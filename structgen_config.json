@@ -2,7 +2,7 @@
   "base_url": "http://promethium:8000/v1",
   "api_key": "sk-no-key-required",
   "model": "qwen2.5-coder-32b-instruct",
-  "temperature": 0.2,
+  "temperature": 0.3,
   "top_p": 0.95,
   "max_tokens": 4096,
   "max_code_repairs": 3,
