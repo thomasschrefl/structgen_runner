@@ -113,7 +113,7 @@ Example config (yours):
 }
 ```
 
-(Additional fields are supported; see your file.) citeturn80search2
+(Additional fields are supported; see your file.)
 
 ---
 
@@ -222,6 +222,7 @@ Outputs are written to `out/<task_slug>/`, including:
 - `<task_slug>.py` (generated Python code)
 - `last_verification.txt` (last verification report)
 - `task.log` (per-task detailed log)
+- `test_run` contains the generated output
 
 The runner also writes a top-level `out/run.log`. 
 
