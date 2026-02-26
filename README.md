@@ -21,7 +21,73 @@ The main entry point is `structgen_run_v2.py`.
 
 ---
 
-## Repository Layout (recommended)
+
+## Prerequisites
+
+1. **Python environment** (recommended via micromamba, see below).
+2. **Java (OpenJDK)** for PlantUML rendering.
+3. **PlantUML jar** available at the path configured in `structgen_config.json` (default `./plantuml.jar`).
+4. An **OpenAI-compatible LLM endpoint** (e.g., `llama-server`) reachable at the `base_url` configured in `structgen_config.json`.
+
+---
+
+## Run in a container
+
+The script executes auto-generated python code. For the security reasons it is good if you run everything in a container.
+
+### Install podman
+
+Install podman   
+
+```bash
+sudo apt-get update
+sudo apt-get install -y podman
+```
+
+Verify
+
+```bash
+podman --version
+podman info
+```
+
+### Build the container
+
+Change to the directory `container`.   
+
+```bash
+cd container
+podman build --no-cache -t structgen-v2:py311 .
+```
+
+### Run inside the container
+
+Change to `run_dir`, and create the directory for the output `out`
+```bash
+cd ../run_dir
+mkdir -p out
+```
+and run inside the container
+```bash
+podman run --rm -it \
+  --userns=keep-id \
+  --user "$(id -u):$(id -g)" \
+  --name structgen_v2_run \
+  -e HOME=/tmp \
+  -e XDG_CACHE_HOME=/tmp/.cache \
+  -v "$PWD:/work:ro" \
+  -v "$PWD/out:/work/out:rw" \
+  -w /work \
+  structgen-v2:py311 \
+  python /work/structgen_run_v2.py
+```
+
+
+---
+
+## File structure
+
+The `run_dir` contains
 
 ```text
 .
@@ -44,42 +110,6 @@ The main entry point is `structgen_run_v2.py`.
 - `plantuml.jar` is required to validate and render diagrams (Java required). 
 - `requirements.txt` is split into tasks using `---` separators. 
 
----
-
-## Prerequisites
-
-1. **Python environment** (recommended via micromamba, see below).
-2. **Java (OpenJDK)** for PlantUML rendering.
-3. **PlantUML jar** available at the path configured in `structgen_config.json` (default `./plantuml.jar`).
-4. An **OpenAI-compatible LLM endpoint** (e.g., `llama-server`) reachable at the `base_url` configured in `structgen_config.json`.
-
----
-
-## Installation (micromamba)
-
-Create an `environment.yml` (as provided):
-
-```yaml
-name: structgen-v2
-channels:
-  - conda-forge
-channel_priority: strict
-dependencies:
-  - python=3.11
-  - openai
-  - numpy
-  - pandas
-  - openjdk
-```
-
-Then create and activate the environment:
-
-```bash
-micromamba env create -f environment.yml
-micromamba activate structgen-v2
-```
-
-> Note: `openjdk` is included so PlantUML can be executed via `java -jar plantuml.jar ...`.
 
 ---
 
@@ -100,7 +130,7 @@ Example config (yours):
   "base_url": "http://promethium:8000/v1",
   "api_key": "sk-no-key-required",
   "model": "qwen2.5-coder-32b-instruct",
-  "temperature": 0.2,
+  "temperature": 0.3,
   "top_p": 0.95,
   "max_tokens": 4096,
   "max_code_repairs": 3,

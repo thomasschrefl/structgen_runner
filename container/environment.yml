@@ -1,0 +1,10 @@
+name: structgen-v2
+channels:
+  - conda-forge
+channel_priority: strict
+dependencies:
+  - python=3.11
+  - openai
+  - numpy
+  - pandas
+  - openjdk  # optional; needed only for PlantUML PNG rendering

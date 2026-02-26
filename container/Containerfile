@@ -1,0 +1,23 @@
+FROM docker.io/mambaorg/micromamba:latest
+
+# Copy your conda env file into the image
+COPY environment.yml /tmp/environment.yml
+
+# Create the environment and clean up caches
+RUN micromamba create -y -n structgen-v2 -f /tmp/environment.yml \
+ && micromamba clean -a -y
+
+# Work directory where you'll mount your project
+WORKDIR /work
+
+# Use micromamba run (avoids shell activation issues in containers)
+ENTRYPOINT ["micromamba", "run", "-n", "structgen-v2"]
+CMD ["python", "--version"]
+
+# plantuml needs graphviz
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends graphviz \
+ && rm -rf /var/lib/apt/lists/*
+# Optional: make dot location explicit (PlantUML also searches /usr/bin/dot by default)
+ENV GRAPHVIZ_DOT=/usr/bin/dot
