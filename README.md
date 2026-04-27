@@ -6,6 +6,28 @@ The core philosophy of StructGen is that **design precedes code**. By forcing th
 
 ---
 
+## Installation
+
+### 1. Clone the repository
+```bash
+git clone https://github.com/thomasschrefl/structgen_runner.git
+cd structgen_runner
+```
+
+### 2. Create the environment
+The recommended way is to use **micromamba** (or conda/mamba) with the provided `environment.yml`:
+```bash
+micromamba create -f environment.yml
+micromamba activate structgen-v2
+```
+
+### 3. PlantUML (Optional for PNG rendering)
+Rendering diagrams to PNG requires **Java** and the `plantuml.jar` file.
+- Java is included in the `environment.yml` (via `openjdk`).
+- Download `plantuml.jar` and place it in your `run_dir_api` or `run_dir_cli` folders.
+
+---
+
 ## Execution Modes
 
 The runner supports two primary ways to interact with LLMs, organized into dedicated directories:
@@ -27,6 +49,33 @@ Invokes a local command-line tool.
   cd run_dir_cli
   micromamba run -n structgen-v2 python structgen_run_v2.py
   ```
+
+---
+
+## Example Library
+
+The `examples/` directory contains reference tasks and test data. To use an example:
+
+1.  **Choose a directory**: Decide if you want to use `run_dir_api` or `run_dir_cli`.
+2.  **Copy Requirements**: Copy the specific `requirements_XX.txt` file to `requirements.txt` inside your chosen run directory.
+3.  **Copy Input Data**: Copy the corresponding `input_XX.csv` file into the same run directory.
+
+### Example Reference Table
+
+| Example | Task | Key Directives |
+| :--- | :--- | :--- |
+| **01: Sensor Denoising** | Rolling median + moving average filters. | `@params: window_size=5`, `@check: rms(value_denoised) <= rms(value_raw)` |
+| **02: Poly Fit** | Fits a polynomial regression of degree `N`. | `@params: degree=2`, `@check: rms(residual) < 2.0` |
+| **03: Irregular Resampling** | Linear interpolation to a regular grid. | `@params: dt=0.5`, `@check: finite(v_interp)` |
+| **04: Group Aggregation** | Categorical grouping and z-score normalization. | `@output_schema: group,measurement,group_mean,group_std,z` |
+
+**CLI Example Command (from root):**
+```bash
+cp examples/requirements_01.txt run_dir_api/requirements.txt
+cp examples/input_01_sensor.csv run_dir_api/
+cd run_dir_api
+micromamba run -n structgen-v2 python structgen_run_v2.py
+```
 
 ---
 
