@@ -2,7 +2,7 @@
 
 StructGen Runner v2 is an automated **structured code generation** framework. It uses Large Language Models (LLMs) to transform natural language requirements into verified, production-ready scientific Python modules through a formal design-first approach.
 
-The core philosophy of StructGen is that **design precedes code**. By forcing the LLM to create and validate PlantUML diagrams before writing a single line of Python, the runner ensures the model has a consistent mental model of the task's logic and data structures. For a detailed overview of the purpose and use of UML in software engineering, see [Visual Paradigm's Guide to UML Diagrams](https://www.visual-paradigm.com/guide/uml/what-is-uml/).
+The core philosophy of StructGen is that **design precedes code**. By forcing the LLM to create and validate PlantUML diagrams before writing a single line of Python, the runner ensures the model has a consistent mental model of the task's logic and data structures. This workflow utilizes [Activity Diagrams](https://www.visual-paradigm.com/guide/uml/what-is-activity-diagram/) to model the dynamic control flow and [Class Diagrams](https://www.visual-paradigm.com/guide/uml/what-is-class-diagram/) to model the static structure of the solution.
 
 ---
 
