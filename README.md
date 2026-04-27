@@ -2,6 +2,8 @@
 
 StructGen Runner v2 is an automated **structured code generation** framework. It uses Large Language Models (LLMs) to transform natural language requirements into verified, production-ready scientific Python modules through a formal design-first approach.
 
+This project is based on the [original StructGen repository](https://github.com/SEDevSys/StructGen) and the paper ["Structure-guided function-level code generation with LLMs via UML activity diagrams"](https://doi.org/10.1016/j.neucom.2025.132502). We expand upon this original work by adding **UML Class Diagrams** (in addition to Activity Diagrams) and a comprehensive **automated code verification** harness.
+
 The framework enforces a rigorous engineering cycle: **Design, Code, Verify.**
 
 The core philosophy of StructGen is that **design precedes code**.
