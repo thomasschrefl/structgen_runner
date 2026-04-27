@@ -90,62 +90,7 @@ The `examples/` directory contains reference tasks and test data. To use an exam
 
 ## The Generation Sequence
 
-The runner follows a hierarchical recovery process to ensure success even if the first attempt fails.
-
-### Sequence Overview (Activity Diagram)
-
-![Generation Sequence](docs/images/generation_sequence.png)
-
-<details>
-<summary>View PlantUML Source</summary>
-
-```plantuml
-@startuml
-start
-:Parse task from **requirements.txt**;
-
-partition "Designer Phase" {
-  :Call Designer LLM;
-  :Extract Activity UML & Class UML;
-  repeat
-    :Validate/Repair UML Syntax;
-  backward:Call UML Repair LLM;
-  repeat while (Syntax Error?) is (Yes)
-  :Render Diagrams to PNG;
-}
-
-partition "Coder Phase" {
-  :Call Coder LLM (Design -> Python);
-  if (Entry point **run()** exists?) then (No)
-    :Immediate Code Repair;
-  endif
-}
-
-repeat
-  partition "Verification & Code Repair" {
-    repeat
-      :Run Verification Harness;
-      if (Verification PASS?) then (Yes)
-        :Materialize Artifacts & test_run;
-        stop
-      else (No)
-        :Call Code Repair LLM;
-      endif
-    repeat while (max_code_repairs reached?) is (No)
-  }
-
-  partition "Design Revision" {
-    :Call Designer (Revise UML Design);
-    :Extract & Validate New UML;
-    :Regenerate Code;
-  }
-repeat while (max_design_revisions reached?) is (No)
-
-:Write best-effort output;
-stop
-@enduml
-```
-</details>
+The runner follows a hierarchical recovery process to ensure success even if the first attempt fails. For a high-level view of this logic, see the [Sequence Overview (Activity Diagram)](#sequence-overview-activity-diagram).
 
 ### 1. Designer Phase
 The LLM generates a complete technical design (Activity, Class, Architecture, Contract). The runner uses a **UML Repair Loop** to ensure the diagrams are syntactically valid PlantUML before the coder ever sees them.
@@ -218,6 +163,63 @@ You can use API mode with [Ollama](https://ollama.com/) by utilizing its OpenAI-
 - **Python 3.10+** (Numpy & Pandas required)
 - **Java (OpenJDK)** (for PlantUML)
 - **Micromamba** (recommended environment manager)
+
+---
+
+## Sequence Overview (Activity Diagram)
+
+![Generation Sequence](docs/images/generation_sequence.png)
+
+<details id="generation-sequence-uml-source">
+<summary>View PlantUML Source</summary>
+
+```plantuml
+@startuml
+start
+:Parse task from **requirements.txt**;
+
+partition "Designer Phase" {
+  :Call Designer LLM;
+  :Extract Activity UML & Class UML;
+  repeat
+    :Validate/Repair UML Syntax;
+  backward:Call UML Repair LLM;
+  repeat while (Syntax Error?) is (Yes)
+  :Render Diagrams to PNG;
+}
+
+partition "Coder Phase" {
+  :Call Coder LLM (Design -> Python);
+  if (Entry point **run()** exists?) then (No)
+    :Immediate Code Repair;
+  endif
+}
+
+repeat
+  partition "Verification & Code Repair" {
+    repeat
+      :Run Verification Harness;
+      if (Verification PASS?) then (Yes)
+        :Materialize Artifacts & test_run;
+        stop
+      else (No)
+        :Call Code Repair LLM;
+      endif
+    repeat while (max_code_repairs reached?) is (No)
+  }
+
+  partition "Design Revision" {
+    :Call Designer (Revise UML Design);
+    :Extract & Validate New UML;
+    :Regenerate Code;
+  }
+repeat while (max_design_revisions reached?) is (No)
+
+:Write best-effort output;
+stop
+@enduml
+```
+</details>
 
 ---
 
