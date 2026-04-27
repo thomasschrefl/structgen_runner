@@ -4,6 +4,44 @@ StructGen Runner v2 is an automated **structured code generation** framework. It
 
 The core philosophy of StructGen is that **design precedes code**. By forcing the LLM to create and validate PlantUML diagrams before writing a single line of Python, the runner ensures the model has a consistent mental model of the task's logic and data structures. This workflow utilizes [Activity Diagrams](https://www.uml-diagrams.org/activity-diagrams.html) to model the dynamic control flow and [Class Diagrams](https://www.uml-diagrams.org/class-diagrams-overview.html) to model the static structure of the solution. For more information, visit [UML-Diagrams.org](https://www.uml-diagrams.org/).
 
+Complementing this is the **Verification Loop**: code is not considered "done" until it passes an automated suite of numerical and structural checks. If verification fails, the system enters an autonomous repair cycle—fixing the code or even revising the design—until the solution is proven correct.
+
+---
+
+## Requirement Packet Format
+
+The `requirements.txt` file is the source of truth for your tasks. It is written in a semi-structured format that includes both natural language goals and machine-readable verification directives.
+
+### Structure
+*   **Multiple Tasks**: You can define multiple tasks in one file by separating them with a line containing only `---`.
+*   **Sections**: Typically includes `TITLE`, `GOAL`, `ENTRY POINT`, and `INPUTS/OUTPUTS` to guide the LLM's understanding.
+*   **Directives**: Machine-readable lines starting with `@` that drive the automated verification harness.
+
+### Verification Directives Reference
+
+| Directive | Purpose | Format | Notes / Examples |
+| :--- | :--- | :--- | :--- |
+| **`@input_file`** | Specifies the source CSV file for the test run. | `@input_file: path/to/file.csv` | Relative to the `requirements.txt` location. |
+| **`@output_file`** | The filename the runner expects the code to create. | `@output_file: result.csv` | Defaults to `output.csv` if omitted. |
+| **`@params`** | Key-value pairs passed to the `run()` function. | `@params: k1=v1, k2=v2` | Supports strings, numbers, booleans, and lists. |
+| **`@output_schema`** | Validates that specific columns exist in the output. | `@output_schema: col1, col2` | Fails if any listed column is missing. |
+| **`@check`** | Numerical or structural assertions on the output data. | `@check: <expression> <op> <val>` | Supports `mean()`, `rms()`, `count()`, etc. |
+
+### Example Directive Block
+```text
+@input_file: sensor_data.csv
+@output_file: denoised.csv
+@params: window_size=5, method="linear"
+@output_schema: timestamp, value_raw, value_clean
+@check: count() > 10
+@check: rms(value_clean) <= rms(value_raw) rel_tol=1e-12
+```
+**Explanation**: This contract tells the runner to:
+1.  Load `sensor_data.csv` as input.
+2.  Execute `run(..., window_size=5, method="linear")`.
+3.  Verify the output contains at least 11 rows.
+4.  Ensure the Root-Mean-Square (RMS) of the cleaned data is less than or equal to the raw data (within a tiny numerical tolerance).
+
 ---
 
 ## Installation
