@@ -73,6 +73,22 @@ The runner executes the generated code in a sandboxed temporary environment:
 
 ---
 
+## Configuration
+
+`structgen_config.json` manages the connection to your LLM:
+
+*   **`llm_provider`**: Choose between `"openai"` (default) or `"cli"`.
+*   **`cli_command_template`**: For `"cli"` provider, define the shell command. 
+    *   Supports placeholders: `{system}`, `{user}`, `{model}`.
+    *   If `{user}` is omitted, the user prompt is passed via standard input (`stdin`).
+    *   Example: `"gemini-cli chat --system {system}"` or `"claude-code -p {user}"`.
+*   `base_url`: Endpoint URL for OpenAI provider (e.g., `http://localhost:8000/v1`).
+*   `model`: The specific model to use (e.g., `qwen2.5-coder-32b-instruct`).
+*   `prompt_token_budget`: Max tokens before auto-compression (e.g., `24000`).
+*   `max_code_repairs`: Number of attempts to fix code before revising the design.
+
+---
+
 ## Example Library
 
 The `examples/` directory demonstrates the Verification DSL:

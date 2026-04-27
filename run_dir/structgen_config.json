@@ -1,7 +1,9 @@
 {
+  "llm_provider": "openai",
   "base_url": "http://promethium:8000/v1",
   "api_key": "sk-no-key-required",
   "model": "qwen2.5-coder-32b-instruct",
+  "cli_command_template": "",
   "temperature": 0.3,
   "top_p": 0.95,
   "max_tokens": 4096,

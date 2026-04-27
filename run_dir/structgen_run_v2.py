@@ -33,8 +33,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-from openai import OpenAI
-
 
 # ----------------------------
 # Utilities
@@ -146,12 +144,20 @@ def setup_logger(log_path: str, also_console: bool = True) -> logging.Logger:
 
 @dataclass
 class Config:
-    # OpenAI-compatible endpoint (llama.cpp-server /v1)
+    # LLM provider: "openai" or "cli"
+    llm_provider: str = "openai"
+
+    # OpenAI-compatible endpoint
     base_url: str = "http://localhost:8080/v1"
     api_key: str = "sk-no-key-required"
 
     # Single model used for designer + coder + summariser
     model: str = "qwen2.5-coder:14b"
+
+    # For llm_provider="cli": command template.
+    # Supports {system}, {user}, {model} placeholders.
+    # If {user} is missing, user prompt is passed via stdin.
+    cli_command_template: str = ""
 
     temperature: float = 0.2
     top_p: float = 0.95
@@ -203,20 +209,51 @@ class Config:
 class LLM:
     def __init__(self, cfg: Config):
         self.cfg = cfg
-        self.client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
+        self.client = None
+        if cfg.llm_provider == "openai":
+            from openai import OpenAI
+            self.client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
 
     def chat(self, system: str, user: str, model: Optional[str] = None) -> str:
-        resp = self.client.chat.completions.create(
-            model=(model or self.cfg.model),
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=self.cfg.temperature,
-            top_p=self.cfg.top_p,
-            max_tokens=self.cfg.max_tokens,
-        )
-        return resp.choices[0].message.content
+        if self.cfg.llm_provider == "openai":
+            if self.client is None:
+                raise RuntimeError("LLM client not initialized for provider 'openai'")
+            resp = self.client.chat.completions.create(
+                model=(model or self.cfg.model),
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=self.cfg.temperature,
+                top_p=self.cfg.top_p,
+                max_tokens=self.cfg.max_tokens,
+            )
+            return resp.choices[0].message.content
+        elif self.cfg.llm_provider == "cli":
+            import shlex
+            import subprocess
+
+            if not self.cfg.cli_command_template:
+                raise ValueError("cli_command_template must be set when llm_provider='cli'")
+
+            cmd_str = self.cfg.cli_command_template
+            cmd_str = cmd_str.replace("{system}", shlex.quote(system))
+            cmd_str = cmd_str.replace("{model}", shlex.quote(model or self.cfg.model))
+
+            input_data = None
+            if "{user}" in cmd_str:
+                cmd_str = cmd_str.replace("{user}", shlex.quote(user))
+            else:
+                input_data = user
+
+            try:
+                cp = subprocess.run(cmd_str, input=input_data, text=True, shell=True, capture_output=True, check=True)
+                return cp.stdout.strip()
+            except subprocess.CalledProcessError as e:
+                err_msg = (e.stderr or e.stdout or str(e)).strip()
+                raise RuntimeError(f"CLI LLM call failed (exit {e.returncode}): {err_msg}")
+        else:
+            raise ValueError(f"Unknown llm_provider: {self.cfg.llm_provider}")
 
 # ----------------------------
 # Prompt logging
