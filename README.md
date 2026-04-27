@@ -45,6 +45,35 @@ Rendering diagrams to PNG requires **Java** and the `plantuml.jar` file.
 
 ---
 
+## Prompts & Orchestration
+
+The `prompts/` directory contains Markdown templates that define the roles and rules for the LLMs. These are the "brains" of the workflow.
+
+### Prompt Templates Reference
+| File | Role | Purpose |
+| :--- | :--- | :--- |
+| `designer_plantuml.md` | **Designer** | Creates the initial Activity and Class diagrams. |
+| `coder_python.md` | **Coder** | Transforms the design and requirements into Python code. |
+| `repair_code.md` | **Repair** | Fixes Python bugs based on verification tracebacks. |
+| `repair_uml.md` | **UML Repair** | Fixes PlantUML syntax errors (Activity diagrams). |
+| `repair_class_uml.md` | **UML Repair** | Fixes PlantUML syntax errors (Class diagrams). |
+| `revise_design.md` | **Revision** | Rethinks the UML design if code repair fails. |
+
+### What is Fixed (Do Not Change)
+The runner relies on specific formatting to parse LLM responses. Modifying these will break the pipeline:
+*   **Placeholders**: Variables like `{REQUIREMENT_PACKET}`, `{UML_TEXT}`, and `{FAILURE_REPORT}` must remain.
+*   **Block Counts**: The Designer **must** output exactly two `plantuml` fenced blocks (Activity first, then Class).
+*   **Section Headers**: Headers like `Architecture:` and `IO and Verification Contract:` are used to extract metadata.
+*   **Entry Point**: The Coder must always implement `def run(input_path, output_path, **params)`.
+
+### What Can Be Customized
+You can tune these areas to improve quality for your specific model:
+*   **Coding Style**: Add rules for type hinting, documentation, or specific library usage (e.g., "Always use `polars` instead of `pandas`").
+*   **Numerical Rules**: Adjust instructions for handling floating-point precision or edge cases.
+*   **Complexity Control**: Instruct the Designer to keep classes "compact" or to prefer flat function structures.
+
+---
+
 ## Execution Modes
 
 The runner supports two primary ways to interact with LLMs, organized into dedicated directories:
