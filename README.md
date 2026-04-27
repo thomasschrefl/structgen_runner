@@ -96,7 +96,56 @@ The runner follows a hierarchical recovery process to ensure success even if the
 
 ![Generation Sequence](docs/images/generation_sequence.png)
 
-[View PlantUML Source](#generation-sequence-uml-source)
+<details>
+<summary>View PlantUML Source</summary>
+
+```plantuml
+@startuml
+start
+:Parse task from **requirements.txt**;
+
+partition "Designer Phase" {
+  :Call Designer LLM;
+  :Extract Activity UML & Class UML;
+  repeat
+    :Validate/Repair UML Syntax;
+  backward:Call UML Repair LLM;
+  repeat while (Syntax Error?) is (Yes)
+  :Render Diagrams to PNG;
+}
+
+partition "Coder Phase" {
+  :Call Coder LLM (Design -> Python);
+  if (Entry point **run()** exists?) then (No)
+    :Immediate Code Repair;
+  endif
+}
+
+repeat
+  partition "Verification & Code Repair" {
+    repeat
+      :Run Verification Harness;
+      if (Verification PASS?) then (Yes)
+        :Materialize Artifacts & test_run;
+        stop
+      else (No)
+        :Call Code Repair LLM;
+      endif
+    repeat while (max_code_repairs reached?) is (No)
+  }
+
+  partition "Design Revision" {
+    :Call Designer (Revise UML Design);
+    :Extract & Validate New UML;
+    :Regenerate Code;
+  }
+repeat while (max_design_revisions reached?) is (No)
+
+:Write best-effort output;
+stop
+@enduml
+```
+</details>
 
 ### 1. Designer Phase
 The LLM generates a complete technical design (Activity, Class, Architecture, Contract). The runner uses a **UML Repair Loop** to ensure the diagrams are syntactically valid PlantUML before the coder ever sees them.
@@ -234,58 +283,3 @@ You can add tolerances to the end of any comparison line:
 3.  **Structural**: Ensure `timestamp` and `value_clean` exist and `value_clean` has no missing values.
 4.  **Count**: Verify the output contains more than 10 rows.
 5.  **Numerical**: Ensure the Root-Mean-Square (RMS) of the cleaned data is less than or equal to the raw data (within a tiny numerical tolerance).
-
----
-
-## Generation Sequence UML Source
-
-<details>
-<summary>View PlantUML Source</summary>
-
-```plantuml
-@startuml
-start
-:Parse task from **requirements.txt**;
-
-partition "Designer Phase" {
-  :Call Designer LLM;
-  :Extract Activity UML & Class UML;
-  repeat
-    :Validate/Repair UML Syntax;
-  backward:Call UML Repair LLM;
-  repeat while (Syntax Error?) is (Yes)
-  :Render Diagrams to PNG;
-}
-
-partition "Coder Phase" {
-  :Call Coder LLM (Design -> Python);
-  if (Entry point **run()** exists?) then (No)
-    :Immediate Code Repair;
-  endif
-}
-
-repeat
-  partition "Verification & Code Repair" {
-    repeat
-      :Run Verification Harness;
-      if (Verification PASS?) then (Yes)
-        :Materialize Artifacts & test_run;
-        stop
-      else (No)
-        :Call Code Repair LLM;
-      endif
-    repeat while (max_code_repairs reached?) is (No)
-  }
-
-  partition "Design Revision" {
-    :Call Designer (Revise UML Design);
-    :Extract & Validate New UML;
-    :Regenerate Code;
-  }
-repeat while (max_design_revisions reached?) is (No)
-
-:Write best-effort output;
-stop
-@enduml
-```
-</details>
