@@ -77,6 +77,11 @@ The runner follows a hierarchical recovery process to ensure success even if the
 
 ### Sequence Overview (Activity Diagram)
 
+![Generation Sequence](docs/images/generation_sequence.png)
+
+<details>
+<summary>View PlantUML Source</summary>
+
 ```plantuml
 @startuml
 start
@@ -123,6 +128,7 @@ repeat while (max_design_revisions reached?) is (No)
 stop
 @enduml
 ```
+</details>
 
 ### 1. Designer Phase
 The LLM generates a complete technical design (Activity, Class, Architecture, Contract). The runner uses a **UML Repair Loop** to ensure the diagrams are syntactically valid PlantUML before the coder ever sees them.
