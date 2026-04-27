@@ -112,6 +112,47 @@ Invokes a local command-line tool.
 
 ---
 
+## Run in a container (Recommended)
+
+Since the runner executes auto-generated Python code, running it inside a container is highly recommended for security isolation.
+
+### 1. Install Podman
+```bash
+sudo apt-get update
+sudo apt-get install -y podman
+```
+
+### 2. Build the Container Image
+Navigate to the `container/` directory and build the image:
+```bash
+cd container
+podman build --no-cache -t structgen-v2:py311 .
+```
+
+### 3. Run inside the Container
+Change to your desired run directory (e.g., `run_dir_api`), ensure the `out` directory exists, and execute:
+
+```bash
+cd ../run_dir_api
+mkdir -p out
+
+podman run --rm -it \
+  --userns=keep-id \
+  --user "$(id -u):$(id -g)" \
+  --name structgen_v2_run \
+  -e HOME=/tmp \
+  -e XDG_CACHE_HOME=/tmp/.cache \
+  -v "$PWD:/work:ro" \
+  -v "$PWD/out:/work/out:rw" \
+  -w /work \
+  structgen-v2:py311 \
+  python /work/structgen_run_v2.py
+```
+
+**Note**: Containerized execution is primarily designed for **API Mode**. CLI Mode may require additional setup to make external tools available inside the container.
+
+---
+
 ## Example Library
 
 The `examples/` directory contains reference tasks and test data. To use an example:
