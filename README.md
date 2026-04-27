@@ -1,28 +1,56 @@
 # StructGen Runner v2 (UML → Python with Verification)
 
-StructGen Runner v2 is a **structured code generation** workflow that leverages Large Language Models (LLMs) to design, implement, and verify scientific Python modules. It follows a rigorous multi-stage process to ensure that the generated code is not only syntactically correct but also meets numerical and functional requirements.
+StructGen Runner v2 is an automated **structured code generation** framework. It uses Large Language Models (LLMs) to transform natural language requirements into verified, production-ready scientific Python modules through a formal design-first approach.
 
-## Core Workflow
+The core philosophy of StructGen is that **design precedes code**. By forcing the LLM to create and validate PlantUML diagrams before writing a single line of Python, the runner ensures the model has a consistent mental model of the task's logic and data structures.
 
-1.  **Design Phase**: The LLM acts as a Designer, creating:
-    *   **Activity Diagram**: High-level control flow (validation, processing, output).
-    *   **Class Diagram**: Structural components and relationships.
-    *   **Architecture**: Lightweight description of helper functions and responsibilities.
-    *   **Verification Contract**: Detailed I/O schema and invariants.
-2.  **UML Validation**: Diagrams are rendered via PlantUML. If syntax errors are found, an auto-repair loop fixes them before proceeding.
-3.  **Implementation Phase**: A Coder LLM implements the design as a single-file Python module with a standardized `run(input_path, output_path, **params)` entry point.
-4.  **Verification Phase**: The code is executed against a **Verification DSL** (Directives like `@check`, `@params`). It uses `pandas` and `numpy` to validate the output CSV.
-5.  **Iterative Repair**: If verification fails, the runner automatically attempts code repairs. If code repair fails repeatedly, it triggers a design revision to rethink the solution.
+---
+
+## The Generation Sequence
+
+The runner executes a multi-agent workflow (Designer -> Coder -> Verifier) with automated feedback loops:
+
+### 1. Task Initialization
+The runner parses `requirements.txt`. Multiple tasks can be defined in a single file, separated by `---` lines.
+
+### 2. Design Phase (The Designer)
+The LLM acts as a software architect to produce:
+*   **Activity Diagram**: A PlantUML flow defining input validation, processing steps, and error handling.
+*   **Class Diagram**: A PlantUML structure defining the internal data models and helper classes.
+*   **Architecture Bullets**: A lightweight description of component responsibilities.
+*   **Verification Contract**: A formal definition of I/O expectations.
+
+### 3. UML Validation & Rendering
+The runner performs automated quality control on the design:
+*   **Syntax Check**: Uses `plantuml -checkonly` to find syntax errors.
+*   **Auto-Repair**: If the UML is invalid, a specialized repair prompt is used to fix the syntax (up to `max_uml_repairs` times).
+*   **Rendering**: Generates `.png` diagrams for human review in the output folder.
+
+### 4. Implementation Phase (The Coder)
+The LLM receives the **validated design** and the original requirements. It must:
+*   Produce a single Python file.
+*   Implement exactly one public entry point: `def run(input_path, output_path, **params)`.
+*   Adhere strictly to the logic defined in the Activity diagram.
+
+### 5. Automated Verification (The Harness)
+The runner executes the generated code in a sandboxed temporary environment:
+*   **Directives Parsing**: Extracts `@check`, `@params`, and `@output_schema` from the requirement packet.
+*   **Execution**: Calls the `run()` function with the specified parameters.
+*   **Assertions**: Uses `pandas` and `numpy` to verify output CSVs against the contract (e.g., checking means, RMS, column existence, or finiteness).
+*   **Capture**: Logs all `stdout`, `stderr`, and full Python tracebacks for debugging.
+
+### 6. Feedback Loops
+*   **Code Repair**: If verification fails, the LLM is given the failure report and traceback to fix the code (up to `max_code_repairs`).
+*   **Design Revision**: If the code cannot be fixed, the runner asks the Designer to **revise the UML diagrams** to address the failure, effectively rethinking the solution.
 
 ---
 
 ## Key Features
 
--   **Standardized Entry Point**: Every module must implement `run(input_path, output_path, **params)`.
--   **Verification DSL**: Machine-readable requirements embedded in the prompt using `@` directives.
+-   **Design-First**: UML diagrams are used as the "source of truth" for code generation.
+-   **Verification DSL**: Machine-readable requirements embedded in prompts using `@` directives.
 -   **Prompt Guardrails**: Automatic estimation and compression of prompts to stay within model token limits.
 -   **Persistent Artifacts**: Successful runs generate a `test_run/` folder containing the produced output and a `run_test_output.py` reproduction script.
--   **UML Auto-Repair**: Ensures that visual documentation is always valid and renderable.
 
 ---
 
@@ -35,75 +63,12 @@ StructGen Runner v2 is a **structured code generation** workflow that leverages 
 │   ├── Containerfile
 │   └── environment.yml
 ├── examples/                # Reference examples and test data
-│   ├── input_01_sensor.csv
-│   ├── requirements_01.txt  # Task with verification directives
-│   └── ...
-└── run_dir/                 # Active execution directory (all scripts run here)
+└── run_dir/                 # Active execution directory
     ├── structgen_run_v2.py  # Main runner script
     ├── structgen_config.json # LLM and environment config
-    ├── plantuml.jar         # PlantUML rendering engine (Java required)
+    ├── plantuml.jar         # PlantUML rendering engine
     ├── requirements.txt     # The task file currently being processed
     └── prompts/             # System prompt templates
-```
-
----
-
-## Getting Started
-
-### 1. Prerequisites
-- **Python 3.10+** with `numpy` and `pandas`.
-- **Java (OpenJDK)** for PlantUML rendering.
-- **LLM Endpoint**: An OpenAI-compatible API (e.g., `llama-server`, `vLLM`, or OpenAI).
-
-### 2. Configuration
-Edit `run_dir/structgen_config.json` to point to your LLM:
-```json
-{
-  "base_url": "http://localhost:8000/v1",
-  "model": "your-model-name"
-}
-```
-
-### 3. Running an Example
-To run one of the included examples:
-```bash
-# 1. Copy example files to the execution directory
-cp examples/requirements_01.txt run_dir/requirements.txt
-cp examples/input_01_sensor.csv run_dir/
-
-# 2. Run the generator (from the run_dir)
-cd run_dir
-python structgen_run_v2.py
-```
-
----
-
-## Execution Modes
-
-### Local Execution
-Ensure you have activated your environment:
-```bash
-micromamba activate structgen-v2
-cd run_dir
-python structgen_run_v2.py --out out_local
-```
-
-### Containerized Execution (Recommended)
-Running in a container provides security isolation for generated code.
-```bash
-# Build (once)
-cd container
-podman build -t structgen-v2:py311 .
-
-# Run (from run_dir)
-cd ../run_dir
-podman run --rm -it \
-  --userns=keep-id \
-  --user "$(id -u):$(id -g)" \
-  -v "$PWD:/work:rw" \
-  -w /work \
-  structgen-v2:py311 \
-  python structgen_run_v2.py
 ```
 
 ---
@@ -123,18 +88,20 @@ The `examples/` directory demonstrates the Verification DSL:
 
 ## Verification DSL Reference
 
-Directives are parsed from `requirements.txt`. Each must be on its own line.
+Directives are parsed from `requirements.txt`.
 
 | Directive | Purpose | Example |
 | :--- | :--- | :--- |
-| `@input_file` | Source CSV path (relative to requirements.txt). | `@input_file: input.csv` |
+| `@input_file` | Source CSV path. | `@input_file: input.csv` |
 | `@output_file` | Expected output filename. | `@output_file: output.csv` |
-| `@params` | Kwargs passed to the Python `run()` function. | `@params: k1=v1, k2=v2` |
-| `@output_schema` | List of columns that MUST exist in the output. | `@output_schema: colA, colB` |
-| `@check` | Numerical or structural assertion. | `@check: mean(col) ~= 1.0` |
+| `@params` | Kwargs passed to `run()`. | `@params: k1=v1, k2=v2` |
+| `@output_schema` | Required output columns. | `@output_schema: colA, colB` |
+| `@check` | Numerical/structural assertion. | `@check: mean(col) ~= 1.0` |
 
-**Supported `@check` functions**: 
-- `columns(a,b,...)`, `finite(a,b,...)`
-- `mean(col)`, `std(col)`, `min(col)`, `max(col)`, `rms(col)`, `unique(col)`, `count()`
-- Operators: `==`, `!=`, `<`, `>`, `<=`, `>=`, `~=` (approximate)
-- Tolerance keywords: `abs_tol=1e-5`, `rel_tol=1e-3`
+---
+
+## Prerequisites
+
+- **Python 3.10+** (Numpy & Pandas required)
+- **Java (OpenJDK)** (for PlantUML)
+- **OpenAI-compatible API** (e.g., `llama-server`, `vLLM`, `Ollama`)
