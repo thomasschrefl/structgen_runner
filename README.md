@@ -6,113 +6,90 @@ The core philosophy of StructGen is that **design precedes code**. By forcing th
 
 ---
 
+## Execution Modes
+
+The runner supports two primary ways to interact with LLMs, organized into dedicated directories:
+
+### 1. API Mode (`run_dir_api`)
+Uses an OpenAI-compatible web API (local or cloud).
+- **Best for**: `llama-server`, `vLLM`, `Ollama`, or OpenAI/Anthropic proxies.
+- **Run**:
+  ```bash
+  cd run_dir_api
+  micromamba run -n structgen-v2 python structgen_run_v2.py
+  ```
+
+### 2. CLI Mode (`run_dir_cli`)
+Invokes a local command-line tool.
+- **Best for**: Tools like `gemini-cli`, `claude-code`, or custom shell scripts.
+- **Run**:
+  ```bash
+  cd run_dir_cli
+  micromamba run -n structgen-v2 python structgen_run_v2.py
+  ```
+
+---
+
+## Configuration (`structgen_config.json`)
+
+The runner behavior is controlled by a JSON configuration file.
+
+### Interface Selection
+| Parameter | Description |
+| :--- | :--- |
+| **`llm_provider`** | Choose between `"openai"` (API-based) or `"cli"` (Command-line based). |
+| **`cli_command_template`** | *(CLI only)* The shell command to run. Supports `{system}`, `{user}`, and `{model}` placeholders. |
+| **`base_url`** | *(API only)* The endpoint URL (e.g., `http://localhost:8080/v1`). |
+| **`api_key`** | *(API only)* Your API key (use `sk-no-key-required` for local servers). |
+
+### LLM Sampling & Control
+| Parameter | API Mode (`openai`) | CLI Mode (`cli`) |
+| :--- | :--- | :--- |
+| **`model`** | Sent to the API. | Injected into `{model}` placeholder. |
+| **`temperature`** | Controls creativity. | **Ignored** (set via CLI tool flags). |
+| **`top_p`** | Controls diversity. | **Ignored**. |
+| **`max_tokens`** | Caps response length. | **Ignored**. |
+
+### Pipeline & Retry Limits (Both Modes)
+| Parameter | Description |
+| :--- | :--- |
+| **`max_code_repairs`** | Number of attempts to fix Python code after verification failure. |
+| **`max_design_revisions`** | Number of times to rethink the UML design if code repair fails. |
+| **`max_uml_repairs`** | Number of attempts to fix PlantUML syntax errors. |
+| **`plantuml_jar_path`** | Path to the `plantuml.jar` executable. |
+
+### Advanced Settings (Both Modes)
+*   **`prompt_token_budget`**: Threshold for automatic prompt compression to save context.
+*   **`log_prompts`**: If `true`, saves all prompts to `out/<task>/prompts_used/` for debugging.
+*   **`fail_on_error_output`**: Fails verification if the code prints `"Error:"` to stderr/stdout.
+
+---
+
+## Using Local LLMs with Ollama
+
+You can use API mode with [Ollama](https://ollama.com/) by utilizing its OpenAI-compatible endpoint.
+
+1.  **Configure Ollama**: Ensure Ollama is running (`ollama serve`).
+2.  **Update `structgen_config.json`**:
+    ```json
+    {
+      "llm_provider": "openai",
+      "base_url": "http://localhost:11434/v1",
+      "api_key": "ollama",
+      "model": "qwen2.5-coder:32b"
+    }
+    ```
+
+---
+
 ## The Generation Sequence
 
-The runner executes a multi-agent workflow (Designer -> Coder -> Verifier) with automated feedback loops:
-
-### 1. Task Initialization
-The runner parses `requirements.txt`. Multiple tasks can be defined in a single file, separated by `---` lines.
-
-### 2. Design Phase (The Designer)
-The LLM acts as a software architect to produce:
-*   **Activity Diagram**: A PlantUML flow defining input validation, processing steps, and error handling.
-*   **Class Diagram**: A PlantUML structure defining the internal data models and helper classes.
-*   **Architecture Bullets**: A lightweight description of component responsibilities.
-*   **Verification Contract**: A formal definition of I/O expectations.
-
-### 3. UML Validation & Rendering
-The runner performs automated quality control on the design:
-*   **Syntax Check**: Uses `plantuml -checkonly` to find syntax errors.
-*   **Auto-Repair**: If the UML is invalid, a specialized repair prompt is used to fix the syntax (up to `max_uml_repairs` times).
-*   **Rendering**: Generates `.png` diagrams for human review in the output folder.
-
-### 4. Implementation Phase (The Coder)
-The LLM receives the **validated design** and the original requirements. It must:
-*   Produce a single Python file.
-*   Implement exactly one public entry point: `def run(input_path, output_path, **params)`.
-*   Adhere strictly to the logic defined in the Activity diagram.
-
-### 5. Automated Verification (The Harness)
-The runner executes the generated code in a sandboxed temporary environment:
-*   **Directives Parsing**: Extracts `@check`, `@params`, and `@output_schema` from the requirement packet.
-*   **Execution**: Calls the `run()` function with the specified parameters.
-*   **Assertions**: Uses `pandas` and `numpy` to verify output CSVs against the contract (e.g., checking means, RMS, column existence, or finiteness).
-*   **Capture**: Logs all `stdout`, `stderr`, and full Python tracebacks for debugging.
-
-### 6. Feedback Loops
-*   **Code Repair**: If verification fails, the LLM is given the failure report and traceback to fix the code (up to `max_code_repairs`).
-*   **Design Revision**: If the code cannot be fixed, the runner asks the Designer to **revise the UML diagrams** to address the failure, effectively rethinking the solution.
-
----
-
-## Key Features
-
--   **Design-First**: UML diagrams are used as the "source of truth" for code generation.
--   **Verification DSL**: Machine-readable requirements embedded in prompts using `@` directives.
--   **Prompt Guardrails**: Automatic estimation and compression of prompts to stay within model token limits.
--   **Persistent Artifacts**: Successful runs generate a `test_run/` folder containing the produced output and a `run_test_output.py` reproduction script.
-
----
-
-## Project Structure
-
-```text
-.
-├── environment.yml          # Project-wide dependencies (micromamba/conda)
-├── container/               # Containerized execution environment
-│   ├── Containerfile
-│   └── environment.yml
-├── examples/                # Reference examples and test data
-└── run_dir/                 # Active execution directory
-    ├── structgen_run_v2.py  # Main runner script
-    ├── structgen_config.json # LLM and environment config
-    ├── plantuml.jar         # PlantUML rendering engine
-    ├── requirements.txt     # The task file currently being processed
-    └── prompts/             # System prompt templates
-```
-
----
-
-## Configuration
-
-`structgen_config.json` manages the connection to your LLM:
-
-*   **`llm_provider`**: Choose between `"openai"` (default) or `"cli"`.
-*   **`cli_command_template`**: For `"cli"` provider, define the shell command. 
-    *   Supports placeholders: `{system}`, `{user}`, `{model}`.
-    *   If `{user}` is omitted, the user prompt is passed via standard input (`stdin`).
-    *   Example: `"gemini-cli chat --system {system}"` or `"claude-code -p {user}"`.
-*   `base_url`: Endpoint URL for OpenAI provider (e.g., `http://localhost:8000/v1`).
-*   `model`: The specific model to use (e.g., `qwen2.5-coder-32b-instruct`).
-*   `prompt_token_budget`: Max tokens before auto-compression (e.g., `24000`).
-*   `max_code_repairs`: Number of attempts to fix code before revising the design.
-
----
-
-## Example Library
-
-The `examples/` directory demonstrates the Verification DSL:
-
-| Example | Task | Key Directives |
-| :--- | :--- | :--- |
-| **01: Sensor Denoising** | Rolling median + moving average filters. | `@params: window_size=5`, `@check: rms(value_denoised) <= rms(value_raw)` |
-| **02: Poly Fit** | Fits a polynomial regression of degree `N`. | `@params: degree=2`, `@check: rms(residual) < 2.0` |
-| **03: Irregular Resampling** | Linear interpolation to a regular grid. | `@params: dt=0.5`, `@check: finite(v_interp)` |
-| **04: Group Aggregation** | Categorical grouping and z-score normalization. | `@output_schema: group,measurement,group_mean,group_std,z` |
-
----
-
-## Verification DSL Reference
-
-Directives are parsed from `requirements.txt`.
-
-| Directive | Purpose | Example |
-| :--- | :--- | :--- |
-| `@input_file` | Source CSV path. | `@input_file: input.csv` |
-| `@output_file` | Expected output filename. | `@output_file: output.csv` |
-| `@params` | Kwargs passed to `run()`. | `@params: k1=v1, k2=v2` |
-| `@output_schema` | Required output columns. | `@output_schema: colA, colB` |
-| `@check` | Numerical/structural assertion. | `@check: mean(col) ~= 1.0` |
+1.  **Task Initialization**: Parses tasks from `requirements.txt`.
+2.  **Design Phase**: Designer LLM generates Activity and Class UML diagrams.
+3.  **UML Validation**: Runner checks UML syntax and auto-repairs if necessary.
+4.  **Implementation**: Coder LLM implements the design as a Python module with a `run()` entry point.
+5.  **Verification**: Runner executes the code against directives like `@check` and `@params`.
+6.  **Success**: Generates a `test_run/` folder with outputs and a reproduction script.
 
 ---
 
@@ -120,4 +97,4 @@ Directives are parsed from `requirements.txt`.
 
 - **Python 3.10+** (Numpy & Pandas required)
 - **Java (OpenJDK)** (for PlantUML)
-- **OpenAI-compatible API** (e.g., `llama-server`, `vLLM`, `Ollama`)
+- **Micromamba** (recommended environment manager)
