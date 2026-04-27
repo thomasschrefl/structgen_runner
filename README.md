@@ -15,72 +15,8 @@ The `requirements.txt` file is the source of truth for your tasks. It is written
 ### Structure
 *   **Multiple Tasks**: You can define multiple tasks in one file by separating them with a line containing only `---`.
 *   **Sections**: Typically includes `TITLE`, `GOAL`, `ENTRY POINT`, and `INPUTS/OUTPUTS` to guide the LLM's understanding.
-*   **Directives**: Machine-readable lines starting with `@` that drive the automated verification harness.
-
-### Verification Directives Reference
-
-## Verification DSL Reference
-
-Directives are parsed from `requirements.txt`. Each must be on its own line starting with `@`.
-
-### 1. Directives Table
-| Directive | Purpose | Format | Notes / Examples |
-| :--- | :--- | :--- | :--- |
-| **`@input_file`** | Specifies the source CSV file. | `@input_file: data.csv` | Relative to the `requirements.txt`. |
-| **`@output_file`** | The expected output filename. | `@output_file: result.csv` | Defaults to `output.csv`. |
-| **`@params`** | Arguments passed to `run()`. | `@params: k=v, k2=v2` | Supports Python-style literals and booleans. |
-| **`@output_schema`** | Required columns in the output. | `@output_schema: a, b, c` | Fails if columns are missing. |
-| **`@check`** | A rule to validate the output CSV. | `@check: <expression>` | See functions/operators below. |
-
-### 2. Supported `@check` Functions
-These can be used on the LEFT or RIGHT side of a comparison:
-
-| Function | Description |
-| :--- | :--- |
-| `mean(col)` | The arithmetic mean of a column. |
-| `std(col)` | The sample standard deviation (ddof=1) of a column. |
-| `min(col)` / `max(col)` | The minimum or maximum value in a column. |
-| `rms(col)` | The Root-Mean-Square of a column: `sqrt(mean(x^2))`. |
-| `unique(col)` | The number of unique values in a column. |
-| `count()` | The total number of rows in the output CSV. |
-
-### 3. Structural Checks (Direct-Action)
-These functions are used as standalone checks (they don't use operators):
-
-*   **`columns(col1, col2, ...)`**: Verifies that all listed columns exist.
-*   **`finite(col1, col2, ...)`**: Verifies that no value in the listed columns is `NaN` or `Inf`.
-
-### 4. Comparison Operators & Tolerance
-The runner supports standard comparisons: `==`, `!=`, `<`, `>`, `<=`, `>=`, and the **approximate** operator `~=`.
-
-**Numeric Tolerance Keywords**:
-You can add tolerances to the end of any comparison line:
-*   `abs_tol=<val>`: Absolute tolerance.
-*   `rel_tol=<val>`: Relative tolerance.
-
-**Example**:
-`@check: mean(y) ~= 10.0 abs_tol=0.1`  
-*(Ensures the mean of 'y' is between 9.9 and 10.1)*
-
----
-
-## Example Directive Block
-```text
-@input_file: sensor_data.csv
-@output_file: denoised.csv
-@params: window_size=5, method="linear"
-@output_schema: timestamp, value_raw, value_clean
-@check: columns(timestamp, value_clean)
-@check: finite(value_clean)
-@check: count() > 10
-@check: rms(value_clean) <= rms(value_raw) rel_tol=1e-12
-```
-**Explanation**: This contract tells the runner to:
-1.  Load `sensor_data.csv` as input.
-2.  Execute `run(..., window_size=5, method="linear")`.
-3.  **Structural**: Ensure `timestamp` and `value_clean` exist and `value_clean` has no missing values.
-4.  **Count**: Verify the output contains more than 10 rows.
-5.  **Numerical**: Ensure the Root-Mean-Square (RMS) of the cleaned data is less than or equal to the raw data (within a tiny numerical tolerance).
+*   **Directives**: Machine-readable lines starting with `@` that drive the automated verification harness. 
+    *   For a complete list of supported directives, see the [Verification DSL Reference](#verification-dsl-reference) at the end of this document.
 
 ---
 
@@ -279,3 +215,68 @@ You can use API mode with [Ollama](https://ollama.com/) by utilizing its OpenAI-
 - **Python 3.10+** (Numpy & Pandas required)
 - **Java (OpenJDK)** (for PlantUML)
 - **Micromamba** (recommended environment manager)
+
+---
+
+## Verification DSL Reference
+
+Directives are parsed from `requirements.txt`. Each must be on its own line starting with `@`.
+
+### 1. Directives Table
+| Directive | Purpose | Format | Notes / Examples |
+| :--- | :--- | :--- | :--- |
+| **`@input_file`** | Specifies the source CSV file. | `@input_file: data.csv` | Relative to the `requirements.txt`. |
+| **`@output_file`** | The expected output filename. | `@output_file: result.csv` | Defaults to `output.csv`. |
+| **`@params`** | Arguments passed to `run()`. | `@params: k=v, k2=v2` | Supports Python-style literals and booleans. |
+| **`@output_schema`** | Required columns in the output. | `@output_schema: a, b, c` | Fails if columns are missing. |
+| **`@check`** | A rule to validate the output CSV. | `@check: <expression>` | See functions/operators below. |
+
+### 2. Supported `@check` Functions
+These can be used on the LEFT or RIGHT side of a comparison:
+
+| Function | Description |
+| :--- | :--- |
+| `mean(col)` | The arithmetic mean of a column. |
+| `std(col)` | The sample standard deviation (ddof=1) of a column. |
+| `min(col)` / `max(col)` | The minimum or maximum value in a column. |
+| `rms(col)` | The Root-Mean-Square of a column: `sqrt(mean(x^2))`. |
+| `unique(col)` | The number of unique values in a column. |
+| `count()` | The total number of rows in the output CSV. |
+
+### 3. Structural Checks (Direct-Action)
+These functions are used as standalone checks (they don't use operators):
+
+*   **`columns(col1, col2, ...)`**: Verifies that all listed columns exist.
+*   **`finite(col1, col2, ...)`**: Verifies that no value in the listed columns is `NaN` or `Inf`.
+
+### 4. Comparison Operators & Tolerance
+The runner supports standard comparisons: `==`, `!=`, `<`, `>`, `<=`, `>=`, and the **approximate** operator `~=`.
+
+**Numeric Tolerance Keywords**:
+You can add tolerances to the end of any comparison line:
+*   `abs_tol=<val>`: Absolute tolerance.
+*   `rel_tol=<val>`: Relative tolerance.
+
+**Example**:
+`@check: mean(y) ~= 10.0 abs_tol=0.1`  
+*(Ensures the mean of 'y' is between 9.9 and 10.1)*
+
+---
+
+### Example Directive Block
+```text
+@input_file: sensor_data.csv
+@output_file: denoised.csv
+@params: window_size=5, method="linear"
+@output_schema: timestamp, value_raw, value_clean
+@check: columns(timestamp, value_clean)
+@check: finite(value_clean)
+@check: count() > 10
+@check: rms(value_clean) <= rms(value_raw) rel_tol=1e-12
+```
+**Explanation**: This contract tells the runner to:
+1.  Load `sensor_data.csv` as input.
+2.  Execute `run(..., window_size=5, method="linear")`.
+3.  **Structural**: Ensure `timestamp` and `value_clean` exist and `value_clean` has no missing values.
+4.  **Count**: Verify the output contains more than 10 rows.
+5.  **Numerical**: Ensure the Root-Mean-Square (RMS) of the cleaned data is less than or equal to the raw data (within a tiny numerical tolerance).
