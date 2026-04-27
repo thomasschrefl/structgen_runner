@@ -1,0 +1,22 @@
+2026-04-27 23:30:19,663 | INFO | Starting StructGen runner (v2)
+2026-04-27 23:30:19,664 | INFO | Requirements: requirements.txt
+2026-04-27 23:30:19,664 | INFO | Prompts dir: prompts
+2026-04-27 23:30:19,664 | INFO | Output dir: out
+2026-04-27 23:30:19,664 | INFO | Smoke test: False
+2026-04-27 23:30:19,664 | INFO | Prompt length check: True (budget=24000)
+2026-04-27 23:30:19,665 | INFO | Found 1 task(s)
+2026-04-27 23:30:21,227 | INFO | Task 1/1: Resample irregular time series to regular grid (CSV -> CSV)
+2026-04-27 23:30:21,228 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] === Task started: Resample irregular time series to regular grid (CSV -> CSV) ===
+2026-04-27 23:30:21,230 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Calling model: qwen2.5-coder-32b-instruct
+2026-04-27 23:30:54,899 | INFO | PlantUML check: java -jar ./plantuml.jar -checkonly -failonerror out/resample-irregular-time-series-to-regular-grid-csv-csv/resample-irregular-time-series-to-regular-grid-csv-csv_activity.puml
+2026-04-27 23:30:56,766 | INFO | PlantUML render: java -jar ./plantuml.jar -failonerror -noerror -tpng out/resample-irregular-time-series-to-regular-grid-csv-csv/resample-irregular-time-series-to-regular-grid-csv-csv_activity.puml -o /home/tom/source/structgen_runner/run_dir/out/resample-irregular-time-series-to-regular-grid-csv-csv
+2026-04-27 23:30:58,468 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Rendered ACTIVITY PNG
+2026-04-27 23:30:58,470 | INFO | PlantUML check: java -jar ./plantuml.jar -checkonly -failonerror out/resample-irregular-time-series-to-regular-grid-csv-csv/resample-irregular-time-series-to-regular-grid-csv-csv_class.puml
+2026-04-27 23:30:59,253 | INFO | PlantUML render: java -jar ./plantuml.jar -failonerror -noerror -tpng out/resample-irregular-time-series-to-regular-grid-csv-csv/resample-irregular-time-series-to-regular-grid-csv-csv_class.puml -o /home/tom/source/structgen_runner/run_dir/out/resample-irregular-time-series-to-regular-grid-csv-csv
+2026-04-27 23:31:00,673 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Rendered CLASS PNG
+2026-04-27 23:31:00,674 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Calling model: qwen2.5-coder-32b-instruct
+2026-04-27 23:31:51,228 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Verification: PASS
+2026-04-27 23:31:51,229 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Verification report: All contract checks passed.
+2026-04-27 23:31:51,229 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Wrote generated code: out/resample-irregular-time-series-to-regular-grid-csv-csv/resample-irregular-time-series-to-regular-grid-csv-csv.py
+2026-04-27 23:31:51,229 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] === Task succeeded ===
+2026-04-27 23:31:51,234 | INFO | All tasks processed

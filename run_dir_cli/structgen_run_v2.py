@@ -1,0 +1,1366 @@
+#!/usr/bin/env python3
+"""StructGen runner v2 (verification DSL) — with stdout/stderr capture AND full tracebacks.
+
+Adds to previous build:
+- When an exception occurs during run(), the verification report includes the full traceback (line numbers).
+- When module exec fails, the verification report includes the full traceback.
+
+Other features retained:
+- PlantUML syntax-check + UML auto-repair after every Designer call.
+- Prompt length guardrail (auto-compress + continue) with warnings.
+- Optional prompt logging.
+- Verification DSL (@input_file, @params, @check, ...).
+
+WARNING: Logging prompts may expose sensitive content. Use only in trusted environments.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import contextlib
+import io
+import json
+import logging
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import traceback
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def slugify(text: str, max_len: int = 80) -> str:
+    text = text.strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    return (text[:max_len] if text else "task")
+
+
+def read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def write_text(path: str, content: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def parse_tasks(requirements_text: str) -> List[str]:
+    tasks: List[str] = []
+    buf: List[str] = []
+    for line in requirements_text.splitlines():
+        if line.strip() == "---":
+            chunk = "\n".join(buf).strip()
+            if chunk:
+                tasks.append(chunk)
+            buf = []
+        else:
+            buf.append(line)
+    chunk = "\n".join(buf).strip()
+    if chunk:
+        tasks.append(chunk)
+    return tasks
+
+
+def infer_title(requirement_packet: str) -> str:
+    m = re.search(r"^\s*TITLE\s*:\s*(.+)$", requirement_packet, flags=re.MULTILINE | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    for line in requirement_packet.splitlines():
+        if line.strip():
+            return line.strip()[:80]
+    return "Untitled Task"
+
+def extract_fenced_block(text: str, lang: str) -> Optional[str]:
+    pattern = rf"```{re.escape(lang)}\s*(.*?)```"
+    m = re.search(pattern, text, flags=re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+def extract_fenced_blocks(text: str, lang: str) -> List[str]:
+    pattern = rf"```{re.escape(lang)}\s*(.*?)```"
+    return [m.group(1).strip() for m in re.finditer(pattern, text, flags=re.DOTALL | re.IGNORECASE)]
+
+def extract_section(text: str, header: str) -> str:
+    pattern = rf"{re.escape(header)}\s*\n(.*?)(\n[A-Z][A-Za-z0-9/& \-\(\)]+:\s*\n|\Z)"
+    m = re.search(pattern, text, flags=re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+def has_toplevel_run(code: str) -> bool:
+    """Return True if code defines a top-level function named 'run'."""
+    try:
+        tree = ast.parse(code)
+    except Exception:
+        # If it doesn't parse, let the normal verification/repair path handle it
+        return False
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == "run":
+            return True
+    return False
+
+def load_prompt(prompts_dir: str, filename: str) -> str:
+    path = os.path.join(prompts_dir, filename)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Missing prompt template: {path}")
+    return read_text(path)
+
+
+def load_prompt_optional(prompts_dir: str, filename: str) -> Optional[str]:
+    path = os.path.join(prompts_dir, filename)
+    return read_text(path) if os.path.exists(path) else None
+
+
+def setup_logger(log_path: str, also_console: bool = True) -> logging.Logger:
+    logger = logging.getLogger(log_path)
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    if also_console:
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setFormatter(fmt)
+        logger.addHandler(ch)
+
+    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    return logger
+
+
+# ----------------------------
+# Config
+# ----------------------------
+
+@dataclass
+class Config:
+    # LLM provider: "openai" or "cli"
+    llm_provider: str = "openai"
+
+    # OpenAI-compatible endpoint
+    base_url: str = "http://localhost:8080/v1"
+    api_key: str = "sk-no-key-required"
+
+    # Single model used for designer + coder + summariser
+    model: str = "qwen2.5-coder:14b"
+
+    # For llm_provider="cli": command template.
+    # Supports {system}, {user}, {model} placeholders.
+    # If {user} is missing, user prompt is passed via stdin.
+    cli_command_template: str = ""
+
+    temperature: float = 0.2
+    top_p: float = 0.95
+    max_tokens: int = 4096
+
+    max_code_repairs: int = 3
+    max_design_revisions: int = 3
+    max_uml_repairs: int = 3
+
+    plantuml_jar_path: str = "./plantuml.jar"
+    smoke_test: bool = False
+
+    log_prompts: bool = False
+    log_prompts_include_runlog: bool = False
+
+    prompt_length_check: bool = True
+    prompt_token_budget: int = 5500
+    prompt_estimator: str = "chars_div_4"
+    compress_target_tokens: int = 2000
+
+    fail_on_error_output: bool = False
+
+    @staticmethod
+    def load(path: str) -> "Config":
+        data = json.loads(read_text(path))
+
+        # Back-compat (old configs)
+        if "ollama_base_url" in data and "base_url" not in data:
+            data["base_url"] = data["ollama_base_url"]
+        if "ollama_api_key" in data and "api_key" not in data:
+            data["api_key"] = data["ollama_api_key"]
+
+        # Prefer any legacy role model if provided
+        for k in ("coder_model", "designer_model", "summarizer_model"):
+            if k in data and data.get(k) and "model" not in data:
+                data["model"] = data[k]
+
+        cfg = Config()
+        for k, v in data.items():
+            if hasattr(cfg, k):
+                setattr(cfg, k, v)
+        return cfg
+
+
+# ----------------------------
+# LLM client
+# ----------------------------
+
+class LLM:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.client = None
+        if cfg.llm_provider == "openai":
+            from openai import OpenAI
+            self.client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
+
+    def chat(self, system: str, user: str, model: Optional[str] = None) -> str:
+        if self.cfg.llm_provider == "openai":
+            if self.client is None:
+                raise RuntimeError("LLM client not initialized for provider 'openai'")
+            resp = self.client.chat.completions.create(
+                model=(model or self.cfg.model),
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=self.cfg.temperature,
+                top_p=self.cfg.top_p,
+                max_tokens=self.cfg.max_tokens,
+            )
+            return resp.choices[0].message.content
+        elif self.cfg.llm_provider == "cli":
+            import shlex
+            import subprocess
+
+            if not self.cfg.cli_command_template:
+                raise ValueError("cli_command_template must be set when llm_provider='cli'")
+
+            cmd_str = self.cfg.cli_command_template
+            cmd_str = cmd_str.replace("{system}", shlex.quote(system))
+            cmd_str = cmd_str.replace("{model}", shlex.quote(model or self.cfg.model))
+
+            input_data = None
+            if "{user}" in cmd_str:
+                cmd_str = cmd_str.replace("{user}", shlex.quote(user))
+            else:
+                input_data = user
+
+            try:
+                cp = subprocess.run(cmd_str, input=input_data, text=True, shell=True, capture_output=True, check=True)
+                return cp.stdout.strip()
+            except subprocess.CalledProcessError as e:
+                err_msg = (e.stderr or e.stdout or str(e)).strip()
+                raise RuntimeError(f"CLI LLM call failed (exit {e.returncode}): {err_msg}")
+        else:
+            raise ValueError(f"Unknown llm_provider: {self.cfg.llm_provider}")
+
+# ----------------------------
+# Prompt logging
+# ----------------------------
+
+def log_prompt_bundle(
+    enabled: bool,
+    include_runlog: bool,
+    task_dir: str,
+    task_logger: logging.Logger,
+    run_logger: logging.Logger,
+    tag: str,
+    system_prompt: str,
+    user_prompt: str,
+) -> None:
+    if not enabled:
+        return
+
+    prompts_dir = os.path.join(task_dir, "prompts_used")
+    os.makedirs(prompts_dir, exist_ok=True)
+
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    safe_tag = re.sub(r"[^a-zA-Z0-9_\-]+", "_", tag)[:80]
+    path = os.path.join(prompts_dir, f"{ts}_{safe_tag}.txt")
+
+    blob = (
+        f"=== PROMPT TAG: {tag} ===\n"
+        f"=== SYSTEM ===\n{system_prompt}\n\n"
+        f"=== USER ===\n{user_prompt}\n"
+    )
+    write_text(path, blob)
+
+    task_logger.info("PROMPT_SAVED: %s", path)
+    if include_runlog:
+        run_logger.info("PROMPT_SAVED: %s", path)
+
+
+# ----------------------------
+# Prompt length guardrail (estimate + compress)
+# ----------------------------
+
+def estimate_tokens(text: str, method: str) -> int:
+    if not text:
+        return 0
+    if method == "words_1p3":
+        return int(len(text.split()) * 1.3)
+    return max(1, len(text) // 4)
+
+
+def needs_compress(cfg: Config, system_prompt: str, user_prompt: str) -> Tuple[bool, int]:
+    if not cfg.prompt_length_check:
+        return False, 0
+    est = estimate_tokens(system_prompt, cfg.prompt_estimator) + estimate_tokens(user_prompt, cfg.prompt_estimator)
+    return est > cfg.prompt_token_budget, est
+
+
+def summarise_text(llm: LLM, cfg: Config, text: str, target_tokens: int, purpose: str, task_logger: logging.Logger) -> str:
+    max_chars = target_tokens * 8
+    truncated = text if len(text) <= max_chars * 8 else text[: max_chars * 8]
+    if truncated is not text:
+        task_logger.warning("Summariser input truncated for %s.", purpose)
+
+    model = cfg.model
+    system_p = "Compress without losing constraints."
+    user_p = (
+        f"Compress the following content to <= {target_tokens} tokens (roughly).\n"
+        "Preserve: function signature, I/O schema, constraints, allowed libraries, determinism rules, and any '@' directives.\n"
+        "Remove: redundancy, long prose, examples unless essential.\n\n"
+        f"PURPOSE: {purpose}\n\n"
+        f"CONTENT:\n{truncated}"
+    )
+    out = llm.chat(system=system_p, user=user_p, model=model)
+    return out.strip()
+
+
+def auto_compress_prompts(
+    llm: LLM,
+    cfg: Config,
+    system_prompt: str,
+    user_prompt: str,
+    components: Dict[str, str],
+    task_logger: logging.Logger,
+) -> Tuple[str, str, bool, int]:
+    too_long, est = needs_compress(cfg, system_prompt, user_prompt)
+    if not too_long:
+        return system_prompt, user_prompt, False, est
+
+    task_logger.warning(
+        "Estimated prompt tokens (%d) exceed budget (%d). Auto-compressing and continuing.",
+        est,
+        cfg.prompt_token_budget,
+    )
+
+    new_user = user_prompt
+    for name, original in components.items():
+        if not original:
+            continue
+        comp = summarise_text(llm, cfg, original, cfg.compress_target_tokens, purpose=name, task_logger=task_logger)
+        if original in new_user:
+            new_user = new_user.replace(original, comp)
+        else:
+            new_user += f"\n\n[COMPRESSED_{name}]\n{comp}\n"
+
+    too_long2, est2 = needs_compress(cfg, system_prompt, new_user)
+    if too_long2:
+        keep_chars = int(cfg.prompt_token_budget * 4)
+        task_logger.warning("Prompt still too long after compression (est=%d). Truncating user prompt tail.", est2)
+        new_user = new_user[:keep_chars] + "\n\n[TRUNCATED_FOR_BUDGET]"
+        est2 = estimate_tokens(system_prompt, cfg.prompt_estimator) + estimate_tokens(new_user, cfg.prompt_estimator)
+
+    return system_prompt, new_user, True, est2
+
+
+# ----------------------------
+# PlantUML (syntax check + render)
+# ----------------------------
+
+def plantuml_check(puml_path: str, jar_path: str, logger: logging.Logger) -> Tuple[bool, str]:
+    if not os.path.exists(jar_path):
+        return False, f"PlantUML jar not found at {jar_path}"
+    try:
+        cmd = ["java", "-jar", jar_path, "-checkonly", "-failonerror", puml_path]
+        logger.info("PlantUML check: %s", " ".join(cmd))
+        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if cp.returncode == 0:
+            return True, ""
+        err = (cp.stderr or cp.stdout or "").strip() or f"PlantUML syntax check failed (exit code {cp.returncode})."
+        return False, err
+    except FileNotFoundError:
+        return False, "Java not found on PATH (install Java to enable PlantUML)."
+
+
+def plantuml_render_png(puml_path: str, png_path: str, jar_path: str, logger: logging.Logger) -> Tuple[bool, str]:
+    if not os.path.exists(jar_path):
+        return False, f"PlantUML jar not found at {jar_path}"
+
+    out_dir_abs = os.path.abspath(os.path.dirname(png_path))
+    os.makedirs(out_dir_abs, exist_ok=True)
+
+    try:
+        cmd = ["java", "-jar", jar_path, "-failonerror", "-noerror", "-tpng", puml_path, "-o", out_dir_abs]
+        logger.info("PlantUML render: %s", " ".join(cmd))
+        cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if cp.returncode != 0:
+            err = (cp.stderr or cp.stdout or "").strip() or f"PlantUML render failed (exit code {cp.returncode})."
+            return False, err
+
+        base = os.path.splitext(os.path.basename(puml_path))[0]
+        produced = os.path.join(out_dir_abs, base + ".png")
+        if os.path.exists(produced):
+            if os.path.abspath(produced) != os.path.abspath(png_path):
+                shutil.move(produced, png_path)
+            return True, ""
+        return False, "PlantUML did not produce an output PNG."
+
+    except FileNotFoundError:
+        return False, "Java not found on PATH (install Java to enable PlantUML)."
+
+
+def build_repair_uml_prompt(
+    diagram_kind: str,
+    requirement_packet: str,
+    uml_text: str,
+    plantuml_error: str,
+    template: Optional[str],
+) -> str:
+    """
+    Build a repair prompt for PlantUML.
+    diagram_kind: "activity" or "class"
+    """
+    if template:
+        return template.format(
+            REQUIREMENT_PACKET=requirement_packet,
+            UML_TEXT=uml_text,
+            PLANTUML_ERROR=plantuml_error,
+        )
+
+    if diagram_kind == "class":
+        return (
+            "Role: Designer (UML Repair / CLASS)\n"
+            "Fix ONLY PlantUML class diagram syntax so -checkonly passes and PNG renders.\n"
+            "Rules: one @startuml..@enduml; use class/interface/enum/package; relationships ok "
+            "(--, <|--, *--, o--, ..>, ..|>).\n"
+            "No Markdown inside UML.\n\n"
+            f"PlantUML error:\n{plantuml_error}\n\n"
+            f"Requirement packet:\n{requirement_packet}\n\n"
+            f"Previous UML:\n```plantuml\n{uml_text}\n```\n\n"
+            "OUTPUT: one fenced ```plantuml``` block only.\n"
+        )
+
+    # default: activity
+    return (
+        "Role: Designer (UML Repair / ACTIVITY)\n"
+        "Fix ONLY PlantUML activity diagram syntax so -checkonly passes and PNG renders.\n"
+        "Rules: one @startuml..@enduml, start/stop, :actions;, if/endif, while/endwhile, repeat/repeat while.\n"
+        "Forbidden: '->', participant/actor, 'do', 'end while', Markdown inside UML.\n\n"
+        f"PlantUML error:\n{plantuml_error}\n\n"
+        f"Requirement packet:\n{requirement_packet}\n\n"
+        f"Previous UML:\n```plantuml\n{uml_text}\n```\n\n"
+        "OUTPUT: one fenced ```plantuml``` block only.\n"
+    )
+
+def validate_and_render_uml_with_repair(
+    llm: LLM,
+    cfg: Config,
+    requirement_packet: str,
+    prompts_dir: str,
+    task_dir: str,
+    task_slug: str,
+    uml_text: str,
+    task_logger: logging.Logger,
+    run_logger: logging.Logger,
+    *,
+    repair_prompt_file: str = "repair_uml.md",
+    diagram_kind: str = "activity",
+) -> Tuple[str, bool, str]:
+    repair_uml_tpl = load_prompt_optional(prompts_dir, repair_prompt_file)
+    puml_path = os.path.join(task_dir, f"{task_slug}.puml")
+    png_path = os.path.join(task_dir, f"{task_slug}.png")
+
+    current_uml = uml_text
+    last_err = ""
+
+    for attempt in range(cfg.max_uml_repairs + 1):
+        write_text(puml_path, current_uml + "\n")
+
+        ok, err = plantuml_check(puml_path, cfg.plantuml_jar_path, run_logger)
+        if not ok:
+            last_err = err
+            task_logger.info("UML syntax check failed (attempt %d/%d): %s", attempt + 1, cfg.max_uml_repairs + 1, err)
+            if attempt >= cfg.max_uml_repairs:
+                return current_uml, False, last_err
+
+            system_p = f"You repair PlantUML {diagram_kind} diagrams to be syntactically valid."
+            user_p = build_repair_uml_prompt(diagram_kind, requirement_packet, current_uml, err, repair_uml_tpl)
+            system_p, user_p, _, _ = auto_compress_prompts(
+                llm, cfg, system_p, user_p,
+                components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both},
+                task_logger=task_logger,
+            )
+            log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_repair_uml", system_p, user_p)
+            repair_out = llm.chat(system=system_p, user=user_p, model=cfg.model)
+            repaired = extract_fenced_block(repair_out, "plantuml")
+            if repaired:
+                current_uml = repaired
+                continue
+            write_text(os.path.join(task_dir, f"uml_repair_raw_{attempt+1}.txt"), repair_out)
+            return current_uml, False, last_err
+
+        ok, err = plantuml_render_png(puml_path, png_path, cfg.plantuml_jar_path, run_logger)
+        if ok:
+            return current_uml, True, ""
+
+        last_err = err
+        task_logger.info("UML render failed (attempt %d/%d): %s", attempt + 1, cfg.max_uml_repairs + 1, err)
+        if attempt >= cfg.max_uml_repairs:
+            return current_uml, False, last_err
+
+        system_p = f"You repair PlantUML {diagram_kind} diagrams to be syntactically valid."
+        user_p = build_repair_uml_prompt(diagram_kind, requirement_packet, current_uml, err, repair_uml_tpl)
+        system_p, user_p, _, _ = auto_compress_prompts(
+            llm, cfg, system_p, user_p,
+            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both},
+            task_logger=task_logger,
+        )
+        log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_repair_uml_after_render", system_p, user_p)
+        repair_out = llm.chat(system=system_p, user=user_p, model=cfg.model)
+        repaired = extract_fenced_block(repair_out, "plantuml")
+        if repaired:
+            current_uml = repaired
+            continue
+        write_text(os.path.join(task_dir, f"uml_repair_raw_{attempt+1}.txt"), repair_out)
+        return current_uml, False, last_err
+
+    return current_uml, False, last_err
+
+
+# ----------------------------
+# Contract parsing
+# ----------------------------
+
+@dataclass
+class Contract:
+    input_file: Optional[str] = None
+    output_file: Optional[str] = None
+    params: Dict[str, Any] = None
+    output_schema: Optional[List[str]] = None
+    checks: List[str] = None
+
+    def __post_init__(self):
+        if self.params is None:
+            self.params = {}
+        if self.checks is None:
+            self.checks = []
+
+
+def _parse_value(s: str) -> Any:
+    s = s.strip()
+    if not s:
+        return ""
+    try:
+        return ast.literal_eval(s)
+    except Exception:
+        low = s.lower()
+        if low == "true":
+            return True
+        if low == "false":
+            return False
+        if low in ("none", "null"):
+            return None
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            return s[1:-1]
+        return s
+
+
+def parse_contract(requirement_packet: str) -> Contract:
+    c = Contract()
+    for raw in requirement_packet.splitlines():
+        line = raw.strip()
+        if not line.startswith("@"):  # only directives
+            continue
+        m = re.match(r"^@([a-zA-Z_]+)\s*:\s*(.*)$", line)
+        if not m:
+            continue
+        key = m.group(1).lower()
+        val = m.group(2).strip()
+        if key == "input_file":
+            c.input_file = val
+        elif key == "output_file":
+            c.output_file = val
+        elif key == "output_schema":
+            c.output_schema = [x.strip() for x in val.split(",") if x.strip()]
+        elif key == "params":
+            parts = [p.strip() for p in val.split(",") if p.strip()]
+            for p in parts:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    c.params[k.strip()] = _parse_value(v)
+        elif key == "check":
+            c.checks.append(val)
+    return c
+
+
+# ----------------------------
+# Contract checks
+# ----------------------------
+
+def _require_numpy_pandas():
+    try:
+        import numpy as np  # type: ignore
+        import pandas as pd  # type: ignore
+        return np, pd
+    except Exception as e:
+        raise RuntimeError(
+            "Verification requires numpy and pandas. Install them (pip install numpy pandas). "
+            f"Original error: {e}"
+        )
+
+
+def _eval_expr(expr: str, df, np) -> float:
+    expr = expr.strip()
+    try:
+        return float(expr)
+    except Exception:
+        pass
+
+    fn_m = re.match(r"^(mean|std|min|max|rms|unique)\(([A-Za-z0-9_]+)\)$", expr)
+    if fn_m:
+        fn, col = fn_m.group(1), fn_m.group(2)
+        if col not in df.columns:
+            raise ValueError(f"Unknown column '{col}' in expression '{expr}'")
+        s = df[col]
+        if fn == "mean":
+            return float(s.mean())
+        if fn == "std":
+            return float(s.std(ddof=1))
+        if fn == "min":
+            return float(s.min())
+        if fn == "max":
+            return float(s.max())
+        if fn == "unique":
+            return float(s.nunique(dropna=True))
+        if fn == "rms":
+            arr = s.to_numpy(dtype=float)
+            return float(np.sqrt(float(np.mean(arr * arr))))
+
+    if expr == "count()":
+        return float(len(df))
+
+    raise ValueError(f"Unsupported expression: '{expr}'")
+
+
+def _parse_kwargs(tokens: List[str]) -> Tuple[List[str], Dict[str, Any]]:
+    kwargs: Dict[str, Any] = {}
+    rest = tokens[:]
+    while rest and "=" in rest[-1]:
+        t = rest.pop()
+        k, v = t.split("=", 1)
+        kwargs[k.strip()] = _parse_value(v)
+    return rest, kwargs
+
+
+def _run_checks(checks: List[str], output_path: str, contract: Contract) -> Tuple[bool, str]:
+    np, pd = _require_numpy_pandas()
+
+    if not os.path.exists(output_path):
+        return False, f"Output file not created: {output_path}"
+
+    try:
+        df = pd.read_csv(output_path)
+    except Exception as e:
+        return False, f"Failed to read output CSV '{output_path}': {e}"
+
+    if contract.output_schema:
+        missing = [c for c in contract.output_schema if c not in df.columns]
+        if missing:
+            return False, f"Output schema missing columns {missing}; got columns={list(df.columns)}"
+
+    for raw in checks:
+        line = raw.strip()
+        if not line:
+            continue
+
+        m = re.match(r"^columns\((.*?)\)$", line)
+        if m:
+            cols = [x.strip() for x in m.group(1).split(",") if x.strip()]
+            missing = [c for c in cols if c not in df.columns]
+            if missing:
+                return False, f"Check failed: missing columns {missing}"
+            continue
+
+        m = re.match(r"^finite\((.*?)\)$", line)
+        if m:
+            cols = [x.strip() for x in m.group(1).split(",") if x.strip()]
+            for c in cols:
+                if c not in df.columns:
+                    return False, f"Check failed: finite() refers to missing column '{c}'"
+                arr = df[c].to_numpy(dtype=float)
+                if not np.all(np.isfinite(arr)):
+                    return False, f"Check failed: column '{c}' contains NaN/Inf"
+            continue
+
+        tokens = line.split()
+        tokens2, kwargs = _parse_kwargs(tokens)
+        cmp_str = " ".join(tokens2)
+
+        ops = ["~=", "<=", ">=", "==", "!=", "<", ">"]
+        op_found = None
+        left = right = None
+        for op in ops:
+            if op in cmp_str:
+                parts = cmp_str.split(op)
+                if len(parts) == 2:
+                    left, right = parts[0].strip(), parts[1].strip()
+                    op_found = op
+                    break
+        if not op_found:
+            return False, f"Unsupported check syntax: '{line}'"
+
+        abs_tol = float(kwargs.get("abs_tol", 0.0))
+        rel_tol = float(kwargs.get("rel_tol", 0.0))
+
+        try:
+            lv = _eval_expr(left, df, np)
+            rv = _eval_expr(right, df, np)
+        except Exception as e:
+            return False, f"Check eval failed for '{line}': {e}"
+
+        ok = True
+        if op_found == "<":
+            ok = lv < rv
+        elif op_found == ">":
+            ok = lv > rv
+        elif op_found == "<=":
+            ok = lv <= rv + abs_tol + rel_tol * abs(rv)
+        elif op_found == ">=":
+            ok = lv + abs_tol + rel_tol * abs(lv) >= rv
+        elif op_found == "==":
+            ok = lv == rv
+        elif op_found == "!=":
+            ok = lv != rv
+        elif op_found == "~=":
+            ok = abs(lv - rv) <= abs_tol + rel_tol * abs(rv)
+
+        if not ok:
+            return False, f"Check failed: '{line}' (left={lv}, right={rv}, abs_tol={abs_tol}, rel_tol={rel_tol})"
+
+    return True, "All contract checks passed."
+
+
+# ----------------------------
+# Verification (captures stdout/stderr + full tracebacks)
+# ----------------------------
+
+def _format_captured_io(stdout_txt: str, stderr_txt: str) -> str:
+    parts: List[str] = []
+    if stdout_txt.strip():
+        parts.append("[stdout]\n" + stdout_txt.strip())
+    if stderr_txt.strip():
+        parts.append("[stderr]\n" + stderr_txt.strip())
+    return "\n\n".join(parts)
+
+
+def _format_traceback(exc: BaseException) -> str:
+    tb_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
+    return "".join(tb_lines).rstrip()
+
+
+def verify_generated_code(code: str, requirement_packet: str, requirements_path: str, smoke_test: bool, cfg: Optional[Config] = None) -> Tuple[bool, str]:
+    """Returns (ok, report). If cfg is provided, applies cfg.fail_on_error_output."""
+
+    # compile
+    try:
+        compiled = compile(code, "<generated>", "exec")
+    except Exception as e:
+        tb = _format_traceback(e)
+        return False, f"Compilation error: {e}\n\n[traceback]\n{tb}"
+
+    # exec (import-time)
+    ns: Dict[str, Any] = {}
+    try:
+        exec(compiled, ns, ns)
+    except Exception as e:
+        tb = _format_traceback(e)
+        return False, f"Runtime error during module exec: {e}\n\n[traceback]\n{tb}"
+
+    run_fn = ns.get("run")
+    if not callable(run_fn):
+        return False, "Missing required entry point: run(...)"
+
+    contract = parse_contract(requirement_packet)
+
+    if (not contract.checks) and (not contract.input_file) and (not smoke_test):
+        return True, "Basic verification passed (compile + load + run present)."
+
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            if contract.input_file:
+                req_dir = os.path.dirname(os.path.abspath(requirements_path))
+                src = os.path.join(req_dir, contract.input_file)
+                if not os.path.exists(src):
+                    return False, f"Contract input file not found: {src}"
+                input_path = os.path.join(tmp, os.path.basename(contract.input_file))
+                shutil.copyfile(src, input_path)
+            else:
+                input_path = os.path.join(tmp, "input_placeholder")
+                with open(input_path, "wb") as f:
+                    f.write(b"")
+
+            out_name = contract.output_file or "output.csv"
+            output_path = os.path.join(tmp, out_name)
+
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+
+            run_exc: Optional[BaseException] = None
+            with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                try:
+                    run_fn(input_path, output_path, **(contract.params or {}))
+                except BaseException as e:
+                    run_exc = e
+
+            stdout_txt = buf_out.getvalue()
+            stderr_txt = buf_err.getvalue()
+            captured = _format_captured_io(stdout_txt, stderr_txt)
+
+            # Optional: fail on printed error markers
+            if cfg is not None and cfg.fail_on_error_output:
+                if ("Error:" in stdout_txt) or ("Error:" in stderr_txt):
+                    msg = "Captured error output detected (contains 'Error:'). Treating as verification FAIL."
+                    if captured:
+                        msg += "\n\n" + captured
+                    return False, msg
+
+            if run_exc is not None:
+                tb = _format_traceback(run_exc)
+                msg = f"Run execution raised an exception: {run_exc}\n\n[traceback]\n{tb}"
+                if captured:
+                    msg += "\n\n" + captured
+                return False, msg
+
+            if not os.path.exists(output_path):
+                msg = f"Output file not created: {output_path}"
+                if captured:
+                    msg += "\n\n" + captured
+                return False, msg
+
+            if contract.checks or contract.output_schema:
+                ok, report = _run_checks(contract.checks or [], output_path, contract)
+                if (not ok) and captured:
+                    report += "\n\n" + captured
+                return ok, report
+
+            if smoke_test:
+                msg = "Smoke-test passed (run executed and created output file)."
+                if captured:
+                    msg += "\n\n" + captured
+                return True, msg
+
+            msg = "Basic verification passed."
+            if captured:
+                msg += "\n\n" + captured
+            return True, msg
+
+    except Exception as e:
+        tb = _format_traceback(e)
+        return False, f"Verification harness error: {e}\n\n[traceback]\n{tb}"
+
+
+def repair_missing_run(
+    llm: LLM,
+    cfg: Config,
+    repair_code_tpl: str,
+    requirement_packet: str,
+    uml_text: str,
+    prev_code: str,
+    task_dir: str,
+    task_logger: logging.Logger,
+    run_logger: logging.Logger,
+    tag: str,
+) -> str:
+    system_r = "You repair scientific Python code based on verification feedback."
+    failure_report = "Missing required entry point: run(...)\nAdd a top-level def run(input_path, output_path, **params): ..."
+
+    user_r = repair_code_tpl.format(
+        REQUIREMENT_PACKET=requirement_packet,
+        UML_TEXT=uml_text,
+        PREV_CODE=prev_code,
+        FAILURE_REPORT=failure_report,
+    )
+
+    system_r, user_r, _, _ = auto_compress_prompts(
+        llm, cfg, system_r, user_r,
+        components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_text},
+        task_logger=task_logger,
+    )
+    log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, tag, system_r, user_r)
+
+    out = llm.chat(system=system_r, user=user_r, model=cfg.model)
+    repaired = extract_fenced_block(out, "python")
+    if repaired:
+        return repaired
+    # Fallback: keep raw response for debugging
+    write_text(os.path.join(task_dir, f"{tag}_raw.txt"), out)
+    return prev_code
+
+
+def materialize_test_run_artifacts(
+    code: str,
+    requirement_packet: str,
+    requirements_path: str,
+    task_dir: str,
+    task_slug: str,
+    logger: logging.Logger,
+) -> None:
+    """
+    Re-run the generated run() in a persistent folder so we keep the produced output,
+    and write a small runner script to reproduce it later.
+    """
+    contract = parse_contract(requirement_packet)
+
+    arte_dir = os.path.join(task_dir, "test_run")
+    os.makedirs(arte_dir, exist_ok=True)
+
+    # Resolve input file
+    if contract.input_file:
+        req_dir = os.path.dirname(os.path.abspath(requirements_path))
+        src_input = os.path.join(req_dir, contract.input_file)
+        if not os.path.exists(src_input):
+            raise FileNotFoundError(f"Contract input file not found: {src_input}")
+        in_name = os.path.basename(contract.input_file)
+        input_path = os.path.join(arte_dir, f"input_{in_name}")
+        shutil.copyfile(src_input, input_path)
+    else:
+        # Placeholder input (some tasks don't need it)
+        input_path = os.path.join(arte_dir, "input_placeholder")
+        with open(input_path, "wb") as f:
+            f.write(b"")
+
+    out_name = contract.output_file or "output.csv"
+    output_path = os.path.join(arte_dir, f"output_{os.path.basename(out_name)}")
+
+    # Execute code in-process and call run()
+    compiled = compile(code, "<generated>", "exec")
+    ns: Dict[str, Any] = {}
+    exec(compiled, ns, ns)
+
+    run_fn = ns.get("run")
+    if not callable(run_fn):
+        raise RuntimeError("Missing required entry point: run(...)")
+
+    buf_out = io.StringIO()
+    buf_err = io.StringIO()
+    run_exc: Optional[BaseException] = None
+
+    with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+        try:
+            run_fn(input_path, output_path, **(contract.params or {}))
+        except BaseException as e:
+            run_exc = e
+
+    # Persist captured IO (useful even on success)
+    stdout_txt = buf_out.getvalue()
+    stderr_txt = buf_err.getvalue()
+    captured = _format_captured_io(stdout_txt, stderr_txt)
+    write_text(os.path.join(arte_dir, "captured_io.txt"), (captured + "\n") if captured else "")
+
+    # Persist params
+    write_text(os.path.join(arte_dir, "params.json"), json.dumps(contract.params or {}, indent=2) + "\n")
+
+    if run_exc is not None:
+        tb = _format_traceback(run_exc)
+        raise RuntimeError(f"Re-run to materialize artefacts failed: {run_exc}\n\n{tb}")
+
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"Re-run did not create output file: {output_path}")
+
+    # Write a small runner script to reproduce this later
+    runner_py = os.path.join(arte_dir, "run_test_output.py")
+    module_py = os.path.join(task_dir, f"{task_slug}.py")
+
+    runner_code = f'''#!/usr/bin/env python3
+import json
+import os
+import importlib.util
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+TASK_DIR = os.path.abspath(os.path.join(HERE, ".."))
+MODULE_PATH = os.path.join(TASK_DIR, "{task_slug}.py")
+
+def load_module(path):
+    spec = importlib.util.spec_from_file_location("generated_task", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+def main():
+    params_path = os.path.join(HERE, "params.json")
+    params = json.load(open(params_path, "r", encoding="utf-8"))
+
+    input_path = os.path.join(HERE, os.path.basename("{os.path.basename(input_path)}"))
+    output_path = os.path.join(HERE, os.path.basename("{os.path.basename(output_path)}"))
+
+    mod = load_module(MODULE_PATH)
+    mod.run(input_path, output_path, **params)
+    print("Wrote:", output_path)
+
+if __name__ == "__main__":
+    main()
+'''
+    write_text(runner_py, runner_code)
+    try:
+        os.chmod(runner_py, 0o755)
+    except Exception:
+        pass
+
+    logger.info("Materialized test output: %s", output_path)
+    logger.info("Repro script: %s", runner_py)
+
+
+
+# ----------------------------
+# Task runner
+# ----------------------------
+
+def run_task(llm: LLM, cfg: Config, requirement_packet: str, requirements_path: str, prompts_dir: str, out_dir: str, run_logger: logging.Logger) -> None:
+    title = infer_title(requirement_packet)
+    task_slug = slugify(title)
+    task_dir = os.path.join(out_dir, task_slug)
+    os.makedirs(task_dir, exist_ok=True)
+
+    task_logger = setup_logger(os.path.join(task_dir, "task.log"), also_console=False)
+
+    def log(msg: str, *args: Any) -> None:
+        run_logger.info("[%s] " + msg, task_slug, *args)
+        task_logger.info(msg, *args)
+
+    log("=== Task started: %s ===", title)
+
+    designer_tpl = load_prompt(prompts_dir, "designer_plantuml.md")
+    coder_tpl = load_prompt(prompts_dir, "coder_python.md")
+    repair_code_tpl = load_prompt(prompts_dir, "repair_code.md")
+    revise_design_tpl = load_prompt(prompts_dir, "revise_design.md")
+
+    # ---- Designer initial
+    log("Calling model: %s", cfg.model)
+    system_p = "You are a careful software designer for scientific Python."
+    user_p = designer_tpl.format(REQUIREMENT_PACKET=requirement_packet)
+    system_p, user_p, compressed, est = auto_compress_prompts(
+        llm, cfg, system_p, user_p,
+        components={"REQUIREMENT_PACKET": requirement_packet},
+        task_logger=task_logger,
+    )
+    if compressed:
+        task_logger.warning("Designer prompt auto-compressed (est_tokens_after=%d).", est)
+    log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "designer_initial", system_p, user_p)
+    designer_out = llm.chat(system=system_p, user=user_p, model=cfg.model)
+
+    puml_blocks = extract_fenced_blocks(designer_out, "plantuml")
+    if len(puml_blocks) < 2:
+        write_text(os.path.join(task_dir, "designer_raw.txt"), designer_out)
+        raise RuntimeError("Designer must produce TWO ```plantuml``` blocks (activity + class).")
+
+    uml_activity = puml_blocks[0]
+    uml_class = puml_blocks[1]
+
+    architecture = extract_section(designer_out, "Architecture:")
+    contract_txt = extract_section(designer_out, "IO and Verification Contract:")
+
+    # Render ACTIVITY diagram
+    uml_activity, act_ok, act_err = validate_and_render_uml_with_repair(
+        llm, cfg, requirement_packet, prompts_dir, task_dir,
+        f"{task_slug}_activity",
+        uml_activity, task_logger, run_logger,
+        repair_prompt_file="repair_uml.md",
+        diagram_kind="activity",
+    )
+    if act_ok:
+        log("Rendered ACTIVITY PNG")
+    else:
+        log("ACTIVITY PNG not rendered: %s", act_err)
+
+    # Render CLASS diagram
+    uml_class, cls_ok, cls_err = validate_and_render_uml_with_repair(
+        llm, cfg, requirement_packet, prompts_dir, task_dir,
+        f"{task_slug}_class",  # keeps filenames separate
+        uml_class, task_logger, run_logger,
+        repair_prompt_file="repair_class_uml.md",
+        diagram_kind="class",
+    )
+    if cls_ok:
+        log("Rendered CLASS PNG")
+    else:
+        log("CLASS PNG not rendered: %s", cls_err)
+
+    # Concatenate diagrams for the coder (activity + class)
+    uml_both = uml_activity + "\n\n" + uml_class
+
+    write_text(os.path.join(task_dir, "architecture.txt"), architecture + "\n")
+    write_text(os.path.join(task_dir, "contract.txt"), contract_txt + "\n")
+
+    # ---- Coder initial
+    log("Calling model: %s", cfg.model)
+    system_c = "You are a professional Python developer specialising in numerical/scientific computing."
+    user_c = coder_tpl.format(
+        REQUIREMENT_PACKET=requirement_packet,
+        UML_TEXT=uml_both,
+        ARCHITECTURE_TEXT=architecture,
+        CONTRACT_TEXT=contract_txt,
+    )
+    system_c, user_c, compressed, est = auto_compress_prompts(
+        llm, cfg, system_c, user_c,
+        components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both, "CONTRACT_TEXT": contract_txt},
+        task_logger=task_logger,
+    )
+    if compressed:
+        task_logger.warning("Coder prompt auto-compressed (est_tokens_after=%d).", est)
+    log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, "coder_initial", system_c, user_c)
+    coder_out = llm.chat(system=system_c, user=user_c, model=cfg.model)
+
+    code = extract_fenced_block(coder_out, "python")
+    if not code:
+        write_text(os.path.join(task_dir, "coder_raw.txt"), coder_out)
+        raise RuntimeError("Coder did not produce a Python fenced block. See coder_raw.txt")
+
+    current_code = code
+    # Fast guard: ensure entry point exists before running verification
+    if not has_toplevel_run(current_code):
+        log("Entry point run(...) missing; auto-repairing immediately.")
+        current_code = repair_missing_run(
+            llm, cfg, repair_code_tpl,
+            requirement_packet, uml_both, current_code,
+            task_dir, task_logger, run_logger,
+            tag="coder_repair_missing_run_initial",
+        )    
+        
+    for design_rev in range(cfg.max_design_revisions + 1):
+        for repair in range(cfg.max_code_repairs + 1):
+            ok, report = verify_generated_code(current_code, requirement_packet, requirements_path, cfg.smoke_test, cfg)
+            write_text(os.path.join(task_dir, "last_verification.txt"), report + "\n")
+            log("Verification: %s", "PASS" if ok else "FAIL")
+            log("Verification report: %s", report.splitlines()[0] if report else "")
+
+            if ok:
+                py_path = os.path.join(task_dir, f"{task_slug}.py")
+                write_text(py_path, current_code + "\n")
+                log("Wrote generated code: %s", py_path)
+                log("=== Task succeeded ===")
+                
+                # Create persistent test output + repro script
+                try:
+                    materialize_test_run_artifacts(
+                        current_code,
+                        requirement_packet,
+                        requirements_path,
+                        task_dir,
+                        task_slug,
+                        task_logger,
+                    )
+                except Exception as e:
+                    # Don't fail the whole task if artefact materialization fails,
+                    # but log it loudly.
+                    task_logger.exception("Failed to materialize test-run artefacts: %s", e)
+                    run_logger.exception("[%s] Failed to materialize test-run artefacts: %s", task_slug, e)                
+                
+                return
+
+            if repair >= cfg.max_code_repairs:
+                break
+
+            log("Repairing code (attempt %d/%d)", repair + 1, cfg.max_code_repairs)
+            system_r = "You repair scientific Python code based on verification feedback."
+            user_r = repair_code_tpl.format(
+                REQUIREMENT_PACKET=requirement_packet,
+                UML_TEXT=uml_both,
+                PREV_CODE=current_code,
+                FAILURE_REPORT=report,
+            )
+            system_r, user_r, compressed, est = auto_compress_prompts(
+                llm, cfg, system_r, user_r,
+                components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both},
+                task_logger=task_logger,
+            )
+            if compressed:
+                task_logger.warning("Repair prompt auto-compressed (est_tokens_after=%d).", est)
+            log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"coder_repair_{repair+1}", system_r, user_r)
+            repair_out = llm.chat(system=system_r, user=user_r, model=cfg.model)
+            repaired = extract_fenced_block(repair_out, "python")
+            if repaired:
+                current_code = repaired
+                if not has_toplevel_run(current_code):
+                    log("Repair output still missing run(...); forcing another repair pass.")
+                    current_code = repair_missing_run(
+                        llm, cfg, repair_code_tpl,
+                        requirement_packet, uml_both, current_code,
+                        task_dir, task_logger, run_logger,
+                        tag=f"coder_repair_missing_run_{repair+1}",
+                    )                                
+            else:
+                write_text(os.path.join(task_dir, f"repair_raw_{repair+1}.txt"), repair_out)
+
+        if design_rev >= cfg.max_design_revisions:
+            log("Max design revisions reached; writing best-effort outputs.")
+            py_path = os.path.join(task_dir, f"{task_slug}.py")
+            write_text(py_path, current_code + "\n")
+            return
+
+        # ---- design revision
+        log("Revising design (attempt %d/%d)", design_rev + 1, cfg.max_design_revisions)
+        system_d2 = "You revise UML designs for scientific Python workflows."
+        user_d2 = revise_design_tpl.format(
+            REQUIREMENT_PACKET=requirement_packet,
+            UML_TEXT=uml_both,
+            FAILURE_REPORT=read_text(os.path.join(task_dir, "last_verification.txt")),
+        )
+        system_d2, user_d2, compressed, est = auto_compress_prompts(
+            llm, cfg, system_d2, user_d2,
+            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both},
+            task_logger=task_logger,
+        )
+        if compressed:
+            task_logger.warning("Design revision prompt auto-compressed (est_tokens_after=%d).", est)
+        log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"designer_revision_{design_rev+1}", system_d2, user_d2)
+        revise_out = llm.chat(system=system_d2, user=user_d2, model=cfg.model)
+
+        puml_rev = extract_fenced_blocks(revise_out, "plantuml")
+        if len(puml_rev) >= 2:
+            new_activity = puml_rev[0]
+            new_class = puml_rev[1]
+        else:
+            # Save raw for debugging and keep previous design
+            write_text(os.path.join(task_dir, f"revise_raw_{design_rev+1}.txt"), revise_out)
+            log("Design revision did not return TWO PlantUML blocks; keeping previous UML.")
+            new_activity = None
+            new_class = None
+
+        # Render revised ACTIVITY diagram
+        uml_activity, act_ok, act_err = validate_and_render_uml_with_repair(
+            llm, cfg, requirement_packet, prompts_dir, task_dir,
+            f"{task_slug}_activity",
+            new_activity, task_logger, run_logger,
+            repair_prompt_file="repair_uml.md",
+            diagram_kind="activity",
+        )
+        if act_ok:
+            log("Rendered ACTIVITY PNG after design revision")
+        else:
+            log("ACTIVITY PNG not rendered after design revision: %s", act_err)
+
+        # Render revised CLASS diagram
+        uml_class, cls_ok, cls_err = validate_and_render_uml_with_repair(
+            llm, cfg, requirement_packet, prompts_dir, task_dir,
+            f"{task_slug}_class",
+            new_class, task_logger, run_logger,
+            repair_prompt_file="repair_class_uml.md",
+            diagram_kind="class",
+        )
+        if cls_ok:
+            log("Rendered CLASS PNG after design revision")
+        else:
+            log("CLASS PNG not rendered after design revision: %s", cls_err)
+
+        uml_both = uml_activity + "\n\n" + uml_class
+        
+        new_arch = extract_section(revise_out, "Architecture:")
+        new_contract = extract_section(revise_out, "IO and Verification Contract:")
+
+        if new_arch:
+            architecture = new_arch
+            write_text(os.path.join(task_dir, "architecture.txt"), architecture + "\n")
+
+        if new_contract:
+            contract_txt = new_contract
+            write_text(os.path.join(task_dir, "contract.txt"), contract_txt + "\n")        
+
+        # regenerate code
+        log("Regenerating code after design revision")
+        system_c2 = "You are a professional Python developer specialising in numerical/scientific computing."
+        user_c2 = coder_tpl.format(
+            REQUIREMENT_PACKET=requirement_packet,
+            UML_TEXT=uml_both,
+            ARCHITECTURE_TEXT=architecture,
+            CONTRACT_TEXT=contract_txt,
+        )
+        system_c2, user_c2, compressed, est = auto_compress_prompts(
+            llm, cfg, system_c2, user_c2,
+            components={"REQUIREMENT_PACKET": requirement_packet, "UML_TEXT": uml_both, "CONTRACT_TEXT": contract_txt},
+            task_logger=task_logger,
+        )
+        if compressed:
+            task_logger.warning("Coder-after-design prompt auto-compressed (est_tokens_after=%d).", est)
+        log_prompt_bundle(cfg.log_prompts, cfg.log_prompts_include_runlog, task_dir, task_logger, run_logger, f"coder_after_design_{design_rev+1}", system_c2, user_c2)
+        coder2_out = llm.chat(system=system_c2, user=user_c2, model=cfg.model)
+        regen = extract_fenced_block(coder2_out, "python")
+        if regen:
+            current_code = regen
+            if regen:
+                current_code = regen
+                if not has_toplevel_run(current_code):
+                    log("Regenerated code missing run(...); auto-repairing immediately.")
+                    current_code = repair_missing_run(
+                        llm, cfg, repair_code_tpl,
+                        requirement_packet, uml_both, current_code,
+                        task_dir, task_logger, run_logger,
+                        tag=f"coder_repair_missing_run_after_design_{design_rev+1}",
+                    )                        
+        else:
+            write_text(os.path.join(task_dir, f"coder_raw_after_design_{design_rev+1}.txt"), coder2_out)
+
+
+# ----------------------------
+# CLI
+# ----------------------------
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="StructGen runner v2")
+    parser.add_argument("--config", default="structgen_config.json")
+    parser.add_argument("--requirements", default="requirements.txt")
+    parser.add_argument("--prompts", default="prompts")
+    parser.add_argument("--out", default="out")
+    parser.add_argument("--smoke-test", action="store_true")
+
+    parser.add_argument("--log-prompts", action="store_true")
+    parser.add_argument("--log-prompts-include-runlog", action="store_true")
+
+    parser.add_argument("--prompt-token-budget", type=int, default=None)
+    parser.add_argument("--compress-target-tokens", type=int, default=None)
+
+    args = parser.parse_args()
+
+    cfg = Config.load(args.config)
+    if args.smoke_test:
+        cfg.smoke_test = True
+    if args.log_prompts:
+        cfg.log_prompts = True
+    if args.log_prompts_include_runlog:
+        cfg.log_prompts_include_runlog = True
+    if args.prompt_token_budget is not None:
+        cfg.prompt_token_budget = int(args.prompt_token_budget)
+    if args.compress_target_tokens is not None:
+        cfg.compress_target_tokens = int(args.compress_target_tokens)
+
+    os.makedirs(args.out, exist_ok=True)
+    run_logger = setup_logger(os.path.join(args.out, "run.log"), also_console=True)
+
+    run_logger.info("Starting StructGen runner (v2)")
+    run_logger.info("Requirements: %s", args.requirements)
+    run_logger.info("Prompts dir: %s", args.prompts)
+    run_logger.info("Output dir: %s", args.out)
+    run_logger.info("Smoke test: %s", cfg.smoke_test)
+    run_logger.info("Prompt length check: %s (budget=%s)", cfg.prompt_length_check, cfg.prompt_token_budget)
+
+    tasks = parse_tasks(read_text(args.requirements))
+    run_logger.info("Found %d task(s)", len(tasks))
+
+    llm = LLM(cfg)
+
+    for i, task in enumerate(tasks, start=1):
+        run_logger.info("Task %d/%d: %s", i, len(tasks), infer_title(task))
+        try:
+            run_task(llm, cfg, task, args.requirements, args.prompts, args.out, run_logger)
+        except Exception as e:
+            run_logger.exception("Task failed: %s", e)
+
+    run_logger.info("All tasks processed")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

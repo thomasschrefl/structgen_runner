@@ -1,0 +1,24 @@
+@startuml
+start
+:Validate input parameters;
+if (dt <= 0) then (yes)
+  :Return failure;
+  stop
+else (no)
+  :Read CSV from input_path;
+  :Validate schema (columns t, v);
+  :Verify t is strictly increasing;
+  if (Invalid schema or t) then (yes)
+    :Return failure;
+    stop
+  else (no)
+    :Determine t_min and t_max;
+    :Generate regular grid t_out from t_min to t_max with step dt;
+    :Interpolate v onto t_out using linear method;
+    :Create summary dict (n_in, n_out, dt);
+    :Write t and v_interp to output_path;
+    :Return summary;
+    stop
+  endif
+endif
+@enduml

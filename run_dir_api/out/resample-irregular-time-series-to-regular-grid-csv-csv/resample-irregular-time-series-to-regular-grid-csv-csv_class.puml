@@ -1,0 +1,37 @@
+@startuml
+class Resampler {
+  -input_path: str
+  -output_path: str
+  -dt: float
+  -seed: int | None
+  +run() : dict | None
+  +validate_inputs()
+  +schema_contract_validation()
+  +preprocess()
+  +compute()
+  +postprocess()
+  +write_outputs()
+  +return_summary_dict()
+}
+
+class CSVReader {
+  +read_csv(path: str) : DataFrame
+}
+
+class CSVWriter {
+  +write_csv(path: str, data: DataFrame)
+}
+
+class TimeGrid {
+  +create_regular_grid(min_t: float, max_t: float, dt: float) : array
+}
+
+class Interpolator {
+  +linear_interpolation(t: array, v: array, t_new: array) : array
+}
+
+Resampler --> CSVReader
+Resampler --> CSVWriter
+Resampler --> TimeGrid
+Resampler --> Interpolator
+@enduml

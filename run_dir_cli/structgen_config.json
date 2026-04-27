@@ -1,0 +1,20 @@
+{
+  "llm_provider": "cli",
+  "model": "gemini-1.5-pro",
+  "cli_command_template": "micromamba run -n gemini_env gemini --prompt \"System: {system}\\n\\nUser: \"",
+  "temperature": 0.3,
+  "top_p": 0.95,
+  "max_tokens": 4096,
+  "max_code_repairs": 3,
+  "max_design_revisions": 3,
+  "max_uml_repairs": 3,
+  "plantuml_jar_path": "./plantuml.jar",
+  "smoke_test": false,
+  "log_prompts": false,
+  "log_prompts_include_runlog": false,
+  "prompt_length_check": true,
+  "prompt_token_budget": 24000,
+  "prompt_estimator": "chars_div_4",
+  "compress_target_tokens": 6000,
+  "fail_on_error_output": false
+}

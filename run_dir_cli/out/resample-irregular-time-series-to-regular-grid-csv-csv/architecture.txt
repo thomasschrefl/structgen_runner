@@ -1,0 +1,13 @@
+- TimeResampler: Central coordinator for the resampling workflow.
+- Loader/Validator: Uses pandas to ensure input CSV meets schema and monotonicity constraints.
+- Interpolation Engine: Leverages numpy.interp for efficient, deterministic linear interpolation.
+- Result Writer: Handles CSV serialization of the regularized grid.
+
+5) IO and Verification Contract:
+- Inputs: input_path (CSV), output_path (CSV), dt (float > 0), seed (optional, ignored).
+- Outputs: Summary dictionary with keys [n_in, n_out, dt].
+- Params: dt defaults to 0.5; must be strictly positive.
+- Tolerances: Standard floating point precision for linear interpolation.
+- Determinism: Fully deterministic.
+- Invariants: Output t starts exactly at min(input t); t_out[i] = t_out[0] + i * dt.
+- Edge cases: input_path not found, empty file, non-numeric values, t not increasing, dt larger than range.

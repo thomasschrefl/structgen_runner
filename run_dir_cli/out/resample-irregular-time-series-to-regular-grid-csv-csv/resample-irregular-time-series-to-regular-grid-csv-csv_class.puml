@@ -1,0 +1,17 @@
+@startuml
+class TimeResampler {
+  + run(input_path: str, output_path: str, dt: float, seed: int): dict
+  - _load_data(path: str): DataFrame
+  - _validate(df: DataFrame): void
+  - _interpolate(df: DataFrame, dt: float): DataFrame
+  - _write_results(df: DataFrame, path: str): void
+}
+
+class ResampleSummary <<struct>> {
+  + n_in: int
+  + n_out: int
+  + dt: float
+}
+
+TimeResampler ..> ResampleSummary : returns
+@enduml

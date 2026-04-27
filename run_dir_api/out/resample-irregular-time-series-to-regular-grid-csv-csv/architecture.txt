@@ -1,0 +1,17 @@
+- Resampler: Orchestrates the entire process, manages input/output, and handles the main logic.
+- CSVReader: Handles reading CSV files.
+- CSVWriter: Handles writing CSV files.
+- TimeGrid: Responsible for creating the regular time grid.
+- Interpolator: Performs linear interpolation of the data onto the regular grid.
+
+5) IO and Verification Contract:
+- Inputs:
+  - input_path: Path to the input CSV file with columns t (float seconds) and v (float). t must be strictly increasing.
+- Outputs:
+  - output_path: Path to the output CSV file with columns t and v_interp (interpolated values).
+- Params:
+  - dt: Time step for the regular grid (default 0.5).
+- Tolerances: None specified.
+- Determinism: Yes, the process should produce the same output given the same input.
+- Invariants: No NaNs in v_interp.
+- Edge cases: Handle empty input files, ensure dt is positive, manage edge cases in interpolation.

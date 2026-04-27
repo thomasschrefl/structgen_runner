@@ -1,0 +1,22 @@
+2026-04-27 23:55:11,807 | INFO | Starting StructGen runner (v2)
+2026-04-27 23:55:11,807 | INFO | Requirements: requirements.txt
+2026-04-27 23:55:11,807 | INFO | Prompts dir: prompts
+2026-04-27 23:55:11,807 | INFO | Output dir: out
+2026-04-27 23:55:11,808 | INFO | Smoke test: False
+2026-04-27 23:55:11,808 | INFO | Prompt length check: True (budget=24000)
+2026-04-27 23:55:11,808 | INFO | Found 1 task(s)
+2026-04-27 23:55:11,809 | INFO | Task 1/1: Resample irregular time series to regular grid (CSV -> CSV)
+2026-04-27 23:55:11,810 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] === Task started: Resample irregular time series to regular grid (CSV -> CSV) ===
+2026-04-27 23:55:11,813 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Calling model: gemini-1.5-pro
+2026-04-27 23:55:32,743 | INFO | PlantUML check: java -jar ./plantuml.jar -checkonly -failonerror out/resample-irregular-time-series-to-regular-grid-csv-csv/resample-irregular-time-series-to-regular-grid-csv-csv_activity.puml
+2026-04-27 23:55:34,373 | INFO | PlantUML render: java -jar ./plantuml.jar -failonerror -noerror -tpng out/resample-irregular-time-series-to-regular-grid-csv-csv/resample-irregular-time-series-to-regular-grid-csv-csv_activity.puml -o /home/tom/source/structgen_runner/run_dir_cli/out/resample-irregular-time-series-to-regular-grid-csv-csv
+2026-04-27 23:55:35,744 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Rendered ACTIVITY PNG
+2026-04-27 23:55:35,745 | INFO | PlantUML check: java -jar ./plantuml.jar -checkonly -failonerror out/resample-irregular-time-series-to-regular-grid-csv-csv/resample-irregular-time-series-to-regular-grid-csv-csv_class.puml
+2026-04-27 23:55:36,511 | INFO | PlantUML render: java -jar ./plantuml.jar -failonerror -noerror -tpng out/resample-irregular-time-series-to-regular-grid-csv-csv/resample-irregular-time-series-to-regular-grid-csv-csv_class.puml -o /home/tom/source/structgen_runner/run_dir_cli/out/resample-irregular-time-series-to-regular-grid-csv-csv
+2026-04-27 23:55:37,818 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Rendered CLASS PNG
+2026-04-27 23:55:37,818 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Calling model: gemini-1.5-pro
+2026-04-27 23:56:09,711 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Verification: PASS
+2026-04-27 23:56:09,711 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Verification report: All contract checks passed.
+2026-04-27 23:56:09,712 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] Wrote generated code: out/resample-irregular-time-series-to-regular-grid-csv-csv/resample-irregular-time-series-to-regular-grid-csv-csv.py
+2026-04-27 23:56:09,713 | INFO | [resample-irregular-time-series-to-regular-grid-csv-csv] === Task succeeded ===
+2026-04-27 23:56:09,720 | INFO | All tasks processed

@@ -1,0 +1,11 @@
+@startuml
+start
+:validate inputs;
+:schema/contract validation;
+:preprocess;
+:compute;
+:postprocess;
+:write outputs;
+:return summary dict;
+stop
+@enduml
