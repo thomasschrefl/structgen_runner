@@ -90,6 +90,13 @@ Uses an OpenAI-compatible web API (local or cloud).
 ### 2. CLI Mode (`run_dir_cli`)
 Invokes a local command-line tool.
 - **Best for**: Tools like `gemini-cli`, `claude-code`, or custom shell scripts.
+- **Example: Claude Code**
+  ```json
+  {
+    "llm_provider": "cli",
+    "cli_command_template": "claude -p \"System: {system}\\n\\nUser: \" --dangerously-skip-permissions"
+  }
+  ```
 - **Run**:
   ```bash
   cd run_dir_cli
