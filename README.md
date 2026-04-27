@@ -69,13 +69,72 @@ The `examples/` directory contains reference tasks and test data. To use an exam
 | **03: Irregular Resampling** | Linear interpolation to a regular grid. | `@params: dt=0.5`, `@check: finite(v_interp)` |
 | **04: Group Aggregation** | Categorical grouping and z-score normalization. | `@output_schema: group,measurement,group_mean,group_std,z` |
 
-**CLI Example Command (from root):**
-```bash
-cp examples/requirements_01.txt run_dir_api/requirements.txt
-cp examples/input_01_sensor.csv run_dir_api/
-cd run_dir_api
-micromamba run -n structgen-v2 python structgen_run_v2.py
+---
+
+## The Generation Sequence
+
+The runner follows a hierarchical recovery process to ensure success even if the first attempt fails.
+
+### Sequence Overview (Activity Diagram)
+
+```plantuml
+@startuml
+start
+:Parse task from **requirements.txt**;
+
+partition "Designer Phase" {
+  :Call Designer LLM;
+  :Extract Activity UML & Class UML;
+  repeat
+    :Validate/Repair UML Syntax;
+  backward:Call UML Repair LLM;
+  repeat while (Syntax Error?) is (Yes)
+  :Render Diagrams to PNG;
+}
+
+partition "Coder Phase" {
+  :Call Coder LLM (Design -> Python);
+  if (Entry point **run()** exists?) then (No)
+    :Immediate Code Repair;
+  endif
+}
+
+repeat
+  partition "Verification & Code Repair" {
+    repeat
+      :Run Verification Harness;
+      if (Verification PASS?) then (Yes)
+        :Materialize Artifacts & test_run;
+        stop
+      else (No)
+        :Call Code Repair LLM;
+      endif
+    repeat while (max_code_repairs reached?) is (No)
+  }
+
+  partition "Design Revision" {
+    :Call Designer (Revise UML Design);
+    :Extract & Validate New UML;
+    :Regenerate Code;
+  }
+repeat while (max_design_revisions reached?) is (No)
+
+:Write best-effort output;
+stop
+@enduml
 ```
+
+### 1. Designer Phase
+The LLM generates a complete technical design (Activity, Class, Architecture, Contract). The runner uses a **UML Repair Loop** to ensure the diagrams are syntactically valid PlantUML before the coder ever sees them.
+
+### 2. Coder Phase
+The LLM implements the design. The runner performs a fast AST check to ensure the mandatory `run(input_path, output_path, **params)` entry point exists. If missing, it triggers an immediate targeted repair.
+
+### 3. Verification & Code Repair (Inner Loop)
+The code is executed against the **Verification DSL**. If a check fails, the **Code Repair** loop begins. The LLM receives the **Full Traceback** and the **Capture I/O** (stdout/stderr) to diagnose and fix the specific bug.
+
+### 4. Design Revision (Outer Loop)
+If the code cannot be fixed after `max_code_repairs` (e.g., due to a fundamental logic flaw in the design), the runner triggers a **Design Revision**. The Designer is given the failure reports and asked to redraw the diagrams, which then restarts the implementation cycle.
 
 ---
 
@@ -128,17 +187,6 @@ You can use API mode with [Ollama](https://ollama.com/) by utilizing its OpenAI-
       "model": "qwen2.5-coder:32b"
     }
     ```
-
----
-
-## The Generation Sequence
-
-1.  **Task Initialization**: Parses tasks from `requirements.txt`.
-2.  **Design Phase**: Designer LLM generates Activity and Class UML diagrams.
-3.  **UML Validation**: Runner checks UML syntax and auto-repairs if necessary.
-4.  **Implementation**: Coder LLM implements the design as a Python module with a `run()` entry point.
-5.  **Verification**: Runner executes the code against directives like `@check` and `@params`.
-6.  **Success**: Generates a `test_run/` folder with outputs and a reproduction script.
 
 ---
 
